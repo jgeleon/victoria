@@ -17,10 +17,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const INDEX_JS = path.join(PROJECT_ROOT, 'src', 'index.js');
 const INDEX_HTML = path.join(__dirname, 'index.html');
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
-const PORT = Number(process.env.GUI_PORT || 4321);
+const PORT = Number(process.env.PORT || process.env.GUI_PORT || 4321);
 
 const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
 

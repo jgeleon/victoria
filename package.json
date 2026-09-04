@@ -5,11 +5,12 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "node web/server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "lint": "echo \"No linter configured\"",
     "dev": "node src/index.js",
-    "gui": "node web/server.js"
+    "gui": "node web/server.js",
+    "bot": "node src/index.js"
   },
   "author": "Jean Carlos Gonçalves",
   "license": "PolyForm-Noncommercial-1.0.0",
@@ -18,5 +19,8 @@
     "commander": "^14.0.0",
     "dotenv": "^16.4.7",
     "node-fetch": "^3.3.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
