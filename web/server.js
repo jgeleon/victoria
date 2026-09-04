@@ -35,6 +35,7 @@ try {
   DATA_DIR = fallback;
 }
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+const BOOKINGS_FILE = path.join(DATA_DIR, 'bookings.json');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 
 const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
@@ -43,6 +44,7 @@ const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
 // orderId -> controlador de ciclo { runId, child, phase, timers, flags, durationMs, intervalMs }
 const cycles = new Map();
 let orders = [];
+let bookings = [];
 const clients = new Set();
 
 // ---------------- persistencia ----------------
@@ -54,6 +56,8 @@ function loadOrders() {
   }
 }
 function saveOrders() { fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2)); }
+function loadBookings() { try { bookings = JSON.parse(fs.readFileSync(BOOKINGS_FILE, 'utf8')); } catch { bookings = []; } if (!Array.isArray(bookings)) bookings = []; }
+function saveBookings() { fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2)); }
 function genId(prefix) { return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
 function findOrder(id) { return orders.find((o) => o.id === id); }
 function findOrderByRun(runId) { return orders.find((o) => o.run && o.run.id === runId); }
@@ -92,6 +96,16 @@ function readLogs(runId, limit = 0) {
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) { try { res.write(payload); } catch { /* cerrado */ } }
+}
+function detectBooking(o, line) {
+  const m = line.match(/booked time at (\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/);
+  if (!m) return;
+  const date = m[1], time = m[2];
+  if (bookings.some((b) => b.orderId === o.id && b.date === date && b.time === time)) return; // evita duplicado
+  const bk = { id: genId('bk'), orderId: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId, date, time, bookedAt: Date.now() };
+  bookings.unshift(bk); saveBookings();
+  if (o.run) appendLog(o.run.id, `🎫 CITA RESERVADA: ${date} ${time}`);
+  broadcast('booking', { booking: bk });
 }
 function runningOrderIds() { return [...cycles.keys()]; }
 function broadcastState() { broadcast('state', { runningOrderIds: runningOrderIds() }); }
@@ -162,7 +176,7 @@ function runCycle(o, ctrl) {
   const handle = (chunk, isErr) => {
     let buf = (isErr ? errBuf : outBuf) + chunk.toString();
     const parts = buf.split(/\r?\n/); buf = parts.pop();
-    for (const l of parts) appendLog(ctrl.runId, isErr ? `[err] ${l}` : l);
+    for (const l of parts) { appendLog(ctrl.runId, isErr ? `[err] ${l}` : l); if (!isErr) detectBooking(o, l); }
     if (isErr) errBuf = buf; else outBuf = buf;
   };
   cp.stdout.on('data', (c) => handle(c, false));
@@ -323,6 +337,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && p === '/api/bookings') { sendJSON(res, 200, { bookings }); return; }
+
+  if (req.method === 'POST' && p === '/api/bookings/delete') {
+    const b = await readBody(req);
+    bookings = bookings.filter((x) => x.id !== b.id); saveBookings();
+    sendJSON(res, 200, { ok: true });
+    return;
+  }
+
+  if (req.method === 'POST' && p === '/api/bookings/clear') {
+    bookings = []; saveBookings();
+    sendJSON(res, 200, { ok: true });
+    return;
+  }
+
   if (req.method === 'GET' && p === '/api/stream') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     res.write('\n');
@@ -335,5 +364,20 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('Not found');
 });
 
+function clearLogsHourly() {
+  try {
+    const activeRunIds = new Set(orders.filter((o) => o.run).map((o) => o.run.id));
+    for (const f of fs.readdirSync(LOGS_DIR)) {
+      if (!f.endsWith('.jsonl')) continue;
+      const runId = f.slice(0, -6);
+      const fp = path.join(LOGS_DIR, f);
+      if (activeRunIds.has(runId)) { try { fs.writeFileSync(fp, ''); } catch { /* noop */ } appendLog(runId, '🧹 Logs limpiados automáticamente (cada 1 hora).'); }
+      else { try { fs.unlinkSync(fp); } catch { try { fs.writeFileSync(fp, ''); } catch { /* noop */ } } }
+    }
+  } catch { /* noop */ }
+}
+setInterval(clearLogsHourly, 60 * 60 * 1000); // cada 1 hora
+
 loadOrders();
+loadBookings();
 server.listen(PORT, () => { console.log(`\n  US Visa Bot — Dashboard  →  http://localhost:${PORT}\n`); });

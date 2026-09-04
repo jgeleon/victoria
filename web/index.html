@@ -30,7 +30,11 @@
   .brand .logo{font-size:26px}
   .brand .bt{font-weight:700;font-size:15px}
   .brand .bs{font-size:11px;color:var(--muted)}
-  .navitem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);cursor:default;font-weight:600;font-size:13.5px}
+  .navitem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);cursor:pointer;font-weight:600;font-size:13.5px}
+  .navitem:hover{color:var(--text)}
+  .navcount{margin-left:auto;font-size:11px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:1px 8px;color:var(--muted)}
+  .navcount.hot{background:rgba(46,160,67,.2);color:var(--greenb);border-color:rgba(46,160,67,.5)}
+  .bk-when{color:var(--muted);font-size:12px}
   .navitem.active{background:rgba(47,129,247,.12);color:var(--text)}
   .navitem .ic{width:16px;text-align:center}
   .side-new{margin-top:8px;background:var(--accent2);color:#fff;border:none;border-radius:8px;padding:10px;font-weight:600;cursor:pointer;font-family:inherit;font-size:13.5px}
@@ -141,24 +145,42 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand"><span class="logo">🤖</span><div><div class="bt">US Visa Bot</div><div class="bs">v2.5 · local</div></div></div>
-    <div class="navitem active"><span class="ic">📋</span> Órdenes</div>
+    <div class="navitem active" data-view="orders"><span class="ic">📋</span> Órdenes</div>
+    <div class="navitem" data-view="bookings"><span class="ic">🎫</span> Citas reservadas <span class="navcount" id="navBookings">0</span></div>
     <button class="side-new" id="btnNew">+ Nueva orden</button>
     <div class="side-foot"><span id="footCount">0 órdenes</span><br><b id="footRunning">0 en ejecución</b></div>
   </aside>
 
   <main class="main">
-    <div class="topbar">
-      <h1>Órdenes</h1>
-      <div class="sum"><b id="sumRunning">0</b> en ejecución · <span id="sumTotal">0</span> total</div>
-    </div>
-    <div class="tablewrap">
-      <table class="orders">
-        <thead><tr>
-          <th>ID</th><th>Cliente</th><th>Rango de fechas</th><th>Schedule</th><th>Estado</th><th>Cita agendada</th><th>Acciones</th>
-        </tr></thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
+    <section id="viewOrders">
+      <div class="topbar">
+        <h1>Órdenes</h1>
+        <div class="sum"><b id="sumRunning">0</b> en ejecución · <span id="sumTotal">0</span> total</div>
+      </div>
+      <div class="tablewrap">
+        <table class="orders">
+          <thead><tr>
+            <th>ID</th><th>Cliente</th><th>Rango de fechas</th><th>Schedule</th><th>Estado</th><th>Cita agendada</th><th>Acciones</th>
+          </tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </section>
+    <section id="viewBookings" hidden>
+      <div class="topbar">
+        <h1>Citas reservadas</h1>
+        <div class="sum"><b id="sumBookings">0</b> reservas</div>
+        <button class="btn ghost" id="btnClearBookings" style="margin-left:14px;padding:8px 14px;font-size:12.5px">Limpiar todo</button>
+      </div>
+      <div class="tablewrap">
+        <table class="orders">
+          <thead><tr>
+            <th>Cliente</th><th>Fecha</th><th>Hora</th><th>Schedule</th><th>Reservada</th><th></th>
+          </tr></thead>
+          <tbody id="brows"></tbody>
+        </table>
+      </div>
+    </section>
   </main>
 </div>
 
@@ -414,13 +436,49 @@ function connectStream(){
     render();
     if($('ovLogs').classList.contains('open')){ updateLogStatus(d.order); if(d.order.run && logsRunId!==d.order.run.id && d.order.running){ logsRunId=d.order.run.id; } }
   });
+  es.addEventListener('booking',(e)=>{ const d=JSON.parse(e.data); if(d.booking){ bookings.unshift(d.booking); renderBookings(); if(currentView!=='bookings') $('navBookings').classList.add('hot'); } });
   es.addEventListener('log',(e)=>{const d=JSON.parse(e.data); if(d.runId===logsRunId && $('ovLogs').classList.contains('open')) addLog(d);});
   es.onerror=()=>{};
 }
 
 document.addEventListener('keydown',(e)=>{if(e.key==='Escape'){closeModal('ovOrder');closeModal('ovLogs');}});
+// ---------- vistas / citas reservadas ----------
+let currentView='orders';
+let bookings=[];
+function switchView(v){
+  currentView=v;
+  document.querySelectorAll('.navitem[data-view]').forEach(el=>el.classList.toggle('active', el.dataset.view===v));
+  document.getElementById('viewOrders').hidden = v!=='orders';
+  document.getElementById('viewBookings').hidden = v!=='bookings';
+  if(v==='bookings'){ $('navBookings').classList.remove('hot'); loadBookings(); }
+}
+document.querySelectorAll('.navitem[data-view]').forEach(el=>el.onclick=()=>switchView(el.dataset.view));
+async function loadBookings(){ const r=await fetch('/api/bookings'); const d=await r.json(); bookings=d.bookings||[]; renderBookings(); }
+function renderBookings(){
+  $('navBookings').textContent=bookings.length;
+  $('sumBookings').textContent=bookings.length;
+  const rows=$('brows'); if(!rows)return;
+  if(!bookings.length){ rows.innerHTML='<tr><td colspan="6" class="empty-row">Aún no hay citas reservadas.</td></tr>'; return; }
+  rows.innerHTML='';
+  bookings.forEach(b=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=
+      '<td class="cliente"><div class="cn">'+esc(b.cliente)+'</div><div class="ce">'+esc(b.email||'')+'</div></td>'+
+      '<td><span class="range">'+esc(fmtD(b.date)||b.date)+'</span></td>'+
+      '<td><b style="color:var(--greenb)">'+esc(b.time)+'</b></td>'+
+      '<td><span class="pill-sch">ID: '+esc(b.scheduleId||'')+'</span></td>'+
+      '<td class="bk-when">'+fmtDateTime(b.bookedAt)+'</td>'+
+      '<td><div class="acts"><span class="ab del" data-bkdel="'+b.id+'" title="Quitar del listado">🗑</span></div></td>';
+    rows.appendChild(tr);
+  });
+  rows.querySelectorAll('[data-bkdel]').forEach(el=>el.onclick=()=>delBooking(el.dataset.bkdel));
+}
+async function delBooking(id){ if(!confirm('¿Quitar esta cita del listado?'))return; await fetch('/api/bookings/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); await loadBookings(); }
+$('btnClearBookings').onclick=async()=>{ if(!confirm('¿Borrar TODAS las citas reservadas del listado?'))return; await fetch('/api/bookings/clear',{method:'POST'}); await loadBookings(); };
+
 if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').catch(()=>{}); }
 loadState();
+loadBookings();
 connectStream();
 </script>
 </body>
