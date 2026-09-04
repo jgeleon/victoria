@@ -12,19 +12,33 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const INDEX_JS = path.join(PROJECT_ROOT, 'src', 'index.js');
 const INDEX_HTML = path.join(__dirname, 'index.html');
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const PORT = Number(process.env.PORT || process.env.GUI_PORT || 4321);
+
+// Carpeta de datos: usa DATA_DIR (ideal: un disco persistente). Si no se puede
+// escribir ahí (p. ej. falta montar el disco en la nube), cae a una temporal
+// para que el panel al menos arranque, avisando que NO será persistente.
+let DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+try {
+  fs.mkdirSync(path.join(DATA_DIR, 'logs'), { recursive: true });
+} catch (e) {
+  const fallback = path.join(os.tmpdir(), 'usvisabot-data');
+  fs.mkdirSync(path.join(fallback, 'logs'), { recursive: true });
+  console.warn(`\n  ⚠️  No se pudo escribir en DATA_DIR="${DATA_DIR}" (${e.code}).` +
+    `\n      Usando carpeta temporal "${fallback}" — los datos NO serán persistentes.` +
+    `\n      En Render: agrega un Disk con Mount Path = esa ruta (o "/data") y vuelve a desplegar.\n`);
+  DATA_DIR = fallback;
+}
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
-const PORT = Number(process.env.PORT || process.env.GUI_PORT || 4321);
 
 const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
 
-fs.mkdirSync(LOGS_DIR, { recursive: true });
 
 // orderId -> controlador de ciclo { runId, child, phase, timers, flags, durationMs, intervalMs }
 const cycles = new Map();
