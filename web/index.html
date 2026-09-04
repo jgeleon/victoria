@@ -213,6 +213,9 @@ function fmtRange(o){
   return '—';
 }
 function fmtTime(t){return new Date(t).toLocaleTimeString('es-PE',{hour12:false});}
+function fmtCountdown(ms){ if(ms<=0)return 'reiniciando…'; const s=Math.ceil(ms/1000); return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); }
+function updateCountdowns(){ const now=Date.now(); document.querySelectorAll('.cd[data-reviveat]').forEach(el=>{ const ra=Number(el.dataset.reviveat); el.textContent=ra?fmtCountdown(ra-now):'--:--'; }); }
+setInterval(updateCountdowns,1000);
 function statusOf(o){ if(o.run && o.running) return o.run.status; if(!o.run) return 'stopped'; return o.run.status; }
 const EST_LABEL={running:'En ejecución',paused:'Pausada',stopped:'Detenido',finished:'Finalizada',error:'Error'};
 
@@ -230,7 +233,7 @@ function render(){
     const cita = st==='running'
       ? '<span class="search">Buscando…</span><small>actual: '+esc(o.current||'—')+'</small>'
       : st==='paused'
-      ? '<span class="search">En pausa</span><small>reintenta pronto</small>'
+      ? '<span class="search">Revive en <b class="cd" data-reviveat="'+((o.run&&o.run.reviveAt)||0)+'">--:--</b></span><small>reintento automático</small>'
       : (st==='finished' ? '<span class="done">¡Reservada!</span>' : '<span class="pend">Pendiente</span>');
     const cycleInfo = (o.durationMin||o.intervalMin)
       ? '<small style="display:block;color:var(--muted);font-size:11px;margin-top:3px">♻ '+(o.durationMin||'∞')+'m / '+(o.intervalMin||'—')+'m</small>' : '';
@@ -254,6 +257,7 @@ function render(){
     rows.appendChild(tr);
   });
   bindRowActions();
+  updateCountdowns();
 }
 function bindRowActions(){
   document.querySelectorAll('[data-start]').forEach(el=>el.onclick=()=>act('/api/start',{id:el.dataset.start}));

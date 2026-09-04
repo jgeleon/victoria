@@ -51,12 +51,13 @@ function publicOrder(o) {
   const ctrl = cycles.get(o.id);
   let runStatus = o.run ? o.run.status : null;
   if (o.run && ctrl) runStatus = ctrl.phase; // 'running' | 'paused'
+  const run = o.run ? { id: o.run.id, status: runStatus, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null;
+  if (run && ctrl && ctrl.phase === 'paused' && ctrl.reviveAt) run.reviveAt = ctrl.reviveAt;
   return {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
-    hasPassword: !!o.password, running: orderRunning(o),
-    run: o.run ? { id: o.run.id, status: runStatus, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null,
+    hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
 
@@ -167,6 +168,7 @@ function runCycle(o, ctrl) {
     if (ctrl.intervalMs > 0) {
       const wait = Math.max(0, ctrl.intervalMs - (Date.now() - ctrl.cycleStart));
       ctrl.phase = 'paused';
+      ctrl.reviveAt = Date.now() + wait;
       appendLog(ctrl.runId, `⏸ Ciclo detenido. Revive en ${Math.round(wait / 1000)} s…`);
       pushOrderUpdate(o); broadcastState();
       ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; runCycle(o, ctrl); pushOrderUpdate(o); broadcastState(); }, wait);
