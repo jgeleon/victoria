@@ -59,6 +59,8 @@
   .run .rtime{font-size:11px;color:var(--muted)}
   .run .badge{font-size:10px;padding:1px 6px;border-radius:5px;background:#243447;color:var(--muted);white-space:nowrap}
   .run .badge.dry{background:rgba(210,153,34,.15);color:var(--amber)}
+  .run .rstop{margin-left:2px;color:var(--muted);cursor:pointer;font-size:12px;line-height:1;padding:3px 6px;border-radius:5px;border:1px solid var(--border)}
+  .run .rstop:hover{color:var(--red);border-color:var(--red);background:rgba(229,83,75,.12)}
   .noruns{font-size:12px;color:var(--muted);padding:4px 10px 8px;font-style:italic}
   .empty{color:var(--muted);font-style:italic;font-size:13px}
 
@@ -103,6 +105,15 @@
   .logline.err .msg{color:var(--red)}
   .logline.cmd .msg{color:var(--accent);font-weight:600}
   .logline.ok .msg{color:var(--green)}
+  .logline .tbl{flex:1;min-width:0}
+  .tblhead{color:var(--accent);font-weight:600;margin-bottom:5px}
+  #console table{border-collapse:collapse;font-family:var(--mono);font-size:12px;margin:2px 0 8px;overflow:hidden;border-radius:6px}
+  #console thead th{background:var(--panel2);color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.4px;font-size:10.5px}
+  #console th,#console td{border:1px solid var(--border);padding:4px 12px;text-align:left;white-space:nowrap}
+  #console td.num{color:var(--muted);text-align:right}
+  #console tbody tr:nth-child(even){background:rgba(255,255,255,.03)}
+  #console td .yes{color:var(--green)}
+  #console td .no{color:var(--muted)}
   .banner{margin:12px 18px 0;padding:10px 14px;border-radius:8px;background:rgba(229,83,75,.12);border:1px solid rgba(229,83,75,.4);color:#ffb4ae;font-size:13px;display:none}
 </style>
 </head>
@@ -167,16 +178,19 @@ const btnStart=$('btnStart'), btnStop=$('btnStop');
 let sessions=[];
 let selectedSessionId=null;  // sesión donde caerá la próxima ejecución
 let selectedRunId=null;      // ejecución cuyos logs se muestran
-let running=false, activeRunId=null;
+let runningRunIds=new Set();
 
 const RUN_LABEL={running:'En ejecución',stopped:'Detenida',finished:'Finalizada',error:'Error'};
 
 // ---------- estado global ----------
 function setGlobalStatus(){
-  dot.className='dot '+(running?'running':'');
-  statusText.textContent=running?'En ejecución':'Inactivo';
-  btnStart.disabled=running;
-  btnStop.disabled=!running;
+  const n=runningRunIds.size;
+  dot.className='dot '+(n>0?'running':'');
+  statusText.textContent=n>0?('En ejecución'+(n>1?' ('+n+')':'')):'Inactivo';
+  const s=sessions.find(x=>x.id===selectedSessionId);
+  const sesActive=s?s.runs.some(r=>runningRunIds.has(r.id)):false;
+  btnStart.disabled=!selectedSessionId||sesActive;
+  btnStop.disabled=!(selectedRunId&&runningRunIds.has(selectedRunId));
 }
 
 // ---------- utilidades ----------
@@ -193,7 +207,7 @@ function paramsStr(p){
 // ---------- render de sesiones ----------
 function renderSessions(){
   const box=$('sessionList');
-  if(!sessions.length){ box.innerHTML='<p class="empty">No hay sesiones todavía. Crea una con "+ Nueva".</p>'; updateTargetLabel(); return; }
+  if(!sessions.length){ box.innerHTML='<p class="empty">No hay sesiones todavía. Crea una con "+ Nueva".</p>'; updateTargetLabel(); setGlobalStatus(); return; }
   box.innerHTML='';
   for(const s of sessions){
     const div=document.createElement('div');
@@ -219,15 +233,18 @@ function renderSessions(){
     e.stopPropagation(); deleteSession(el.dataset.del);
   }));
   box.querySelectorAll('[data-run]').forEach(el=>el.addEventListener('click',()=>selectRun(el.dataset.run,el.dataset.ses)));
-  updateTargetLabel();
+  box.querySelectorAll('[data-stoprun]').forEach(el=>el.addEventListener('click',(e)=>{e.stopPropagation();stopRun(el.dataset.stoprun);}));
+  updateTargetLabel(); setGlobalStatus();
 }
 function runRow(r){
   const dry = r.params.dryRun?'<span class="badge dry">simulación</span>':'';
-  const st = r.id===activeRunId && running ? 'running' : r.status;
+  const isRun = runningRunIds.has(r.id);
+  const st = isRun ? 'running' : r.status;
+  const stopBtn = isRun ? '<span class="rstop" data-stoprun="'+r.id+'" title="Detener">■</span>' : '';
   return '<div class="run'+(r.id===selectedRunId?' sel':'')+'" data-run="'+r.id+'" data-ses="'+(findSesOfRun(r.id)||'')+'">'+
     '<span class="dot '+st+'"></span>'+
     '<div class="rmeta"><div class="rparams">'+esc(paramsStr(r.params))+'</div>'+
-    '<div class="rtime">'+fmtDateTime(r.startedAt)+'</div></div>'+dry+'</div>';
+    '<div class="rtime">'+fmtDateTime(r.startedAt)+'</div></div>'+dry+stopBtn+'</div>';
 }
 function findSesOfRun(runId){const s=sessions.find(x=>x.runs.some(r=>r.id===runId));return s?s.id:null;}
 
@@ -261,6 +278,10 @@ function locateRun(runId){
 // ---------- consola ----------
 function addLog(entry){
   const line=entry.line??'';
+  const di=line.indexOf('##DATES##');
+  if(di!==-1 && renderTable(entry.t,'dates',line.slice(di+9))) return;
+  const ti=line.indexOf('##TIMES##');
+  if(ti!==-1 && renderTable(entry.t,'times',line.slice(ti+9))) return;
   const div=document.createElement('div');
   let cls='logline';
   if(line.startsWith('[err]'))cls+=' err';
@@ -272,6 +293,33 @@ function addLog(entry){
   consoleEl.appendChild(div);
   if($('autoscroll').checked)consoleEl.scrollTop=consoleEl.scrollHeight;
 }
+function renderTable(t,kind,jsonStr){
+  let data; try{ data=JSON.parse(jsonStr); }catch(e){ return false; }
+  const wrap=document.createElement('div'); wrap.className='logline';
+  let html='<span class="ts">'+fmtTime(t)+'</span><div class="tbl">';
+  if(kind==='dates'){
+    const rows=Array.isArray(data)?data:[];
+    html+='<div class="tblhead">📅 '+rows.length+' fecha'+(rows.length===1?'':'s')+' disponible'+(rows.length===1?'':'s')+'</div>';
+    if(rows.length){
+      html+='<table><thead><tr><th>#</th><th>Fecha</th><th>Día hábil</th></tr></thead><tbody>';
+      rows.forEach((r,i)=>{ html+='<tr><td class="num">'+(i+1)+'</td><td>'+esc(r.date)+'</td><td>'+(r.business_day?'<span class="yes">Sí</span>':'<span class="no">No</span>')+'</td></tr>'; });
+      html+='</tbody></table>';
+    }
+  } else {
+    const times=(data&&data.times)||[];
+    html+='<div class="tblhead">🕒 '+times.length+' horario'+(times.length===1?'':'s')+(data&&data.date?(' · '+esc(data.date)):'')+'</div>';
+    if(times.length){
+      html+='<table><thead><tr><th>#</th><th>Hora</th></tr></thead><tbody>';
+      times.forEach((h,i)=>{ html+='<tr><td class="num">'+(i+1)+'</td><td>'+esc(h)+'</td></tr>'; });
+      html+='</tbody></table>';
+    }
+  }
+  html+='</div>';
+  wrap.innerHTML=html;
+  consoleEl.appendChild(wrap);
+  if($('autoscroll').checked)consoleEl.scrollTop=consoleEl.scrollHeight;
+  return true;
+}
 function showBanner(msg){const b=$('banner');if(!msg){b.style.display='none';return;}b.textContent=msg;b.style.display='block';setTimeout(()=>b.style.display='none',6000);}
 
 // ---------- config .env ----------
@@ -279,7 +327,7 @@ async function loadAll(){
   const res=await fetch('/api/config');
   const data=await res.json();
   sessions=data.sessions||[];
-  running=data.running; activeRunId=data.activeRunId;
+  runningRunIds=new Set(data.runningRunIds||[]);
   renderCreds(data.askFields);
   renderStatic(data.static);
   if(!selectedSessionId && sessions.length) selectedSessionId=sessions[0].id;
@@ -340,27 +388,30 @@ btnStart.addEventListener('click',async()=>{
   const data=await res.json();
   if(!data.ok)showBanner(data.error||'No se pudo iniciar.');
 });
-btnStop.addEventListener('click',async()=>{
-  const res=await fetch('/api/stop',{method:'POST'});const data=await res.json();
+btnStop.addEventListener('click',()=>stopRun(selectedRunId));
+async function stopRun(runId){
+  if(!runId){showBanner('Selecciona una ejecución en curso para detenerla.');return;}
+  const res=await fetch('/api/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runId})});
+  const data=await res.json();
   if(!data.ok)showBanner(data.error||'No se pudo detener.');
-});
+}
 
 // ---------- stream SSE ----------
 function connectStream(){
   const es=new EventSource('/api/stream');
-  es.addEventListener('status',(e)=>{const d=JSON.parse(e.data);running=d.running;activeRunId=d.activeRunId;setGlobalStatus();renderSessions();});
+  es.addEventListener('status',(e)=>{const d=JSON.parse(e.data);runningRunIds=new Set(d.runningRunIds||[]);renderSessions();});
   es.addEventListener('runstart',(e)=>{
     const d=JSON.parse(e.data);
     const s=sessions.find(x=>x.id===d.sessionId);
-    if(s){s.runs.push(d.run);}
-    activeRunId=d.run.id;running=true;
+    if(s && !s.runs.some(r=>r.id===d.run.id)){s.runs.push(d.run);}
+    runningRunIds.add(d.run.id);
     selectRun(d.run.id,d.sessionId);
-    setGlobalStatus();
   });
   es.addEventListener('runend',(e)=>{
     const d=JSON.parse(e.data);
     const found=locateRun(d.run.id);
     if(found){Object.assign(found.run,d.run);}
+    runningRunIds.delete(d.run.id);
     if(d.run.id===selectedRunId){const f=locateRun(d.run.id);if(f)$('cSub').textContent=paramsStr(f.run.params)+'   ·   '+(RUN_LABEL[f.run.status]||'');}
     renderSessions();
   });

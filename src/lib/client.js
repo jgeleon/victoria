@@ -48,7 +48,8 @@ export class VisaHttpClient {
     log(`📤 REQUEST  GET ${url}`);
     return this._jsonRequest(url, headers)
       .then(data => {
-        log(`📥 RESPONSE (${data.length} fechas):\n${JSON.stringify(data, null, 2)}`);
+        log(`📥 RESPONSE (${data.length} fechas)`);
+        log(`##DATES##${JSON.stringify(data)}`);
         log(`───────────────────────────────────────────`);
         return data.map(item => item.date);
       });
@@ -61,7 +62,9 @@ export class VisaHttpClient {
     log(`📤 REQUEST  GET ${url}`);
     return this._jsonRequest(url, headers)
       .then(data => {
-        log(`📥 RESPONSE (horarios para ${date}):\n${JSON.stringify(data, null, 2)}`);
+        const _times = (data['business_times'] || data['available_times'] || []);
+        log(`📥 RESPONSE (${_times.length} horarios para ${date})`);
+        log(`##TIMES##${JSON.stringify({ date, times: _times })}`);
         log(`───────────────────────────────────────────`);
         return data['business_times'][0] || data['available_times'][0];
       });
