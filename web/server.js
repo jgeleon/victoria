@@ -106,6 +106,15 @@ function detectBooking(o, line) {
   bookings.unshift(bk); saveBookings();
   if (o.run) appendLog(o.run.id, `🎫 CITA RESERVADA: ${date} ${time}`);
   broadcast('booking', { booking: bk });
+  // Al reservar, detener la orden: no debe seguir buscando ni revivir.
+  const ctrl = cycles.get(o.id);
+  if (ctrl) {
+    ctrl.booked = true;
+    if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    if (ctrl.child) ctrl.child.kill('SIGTERM');
+    else endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.');
+  }
 }
 function runningOrderIds() { return [...cycles.keys()]; }
 function broadcastState() { broadcast('state', { runningOrderIds: runningOrderIds() }); }
@@ -189,6 +198,7 @@ function runCycle(o, ctrl) {
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
     ctrl.durationHit = false;
 
+    if (ctrl.booked) { endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.'); return; }
     if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
     if (code === 0) { endCycle(o, ctrl, 'finished', '✅ Objetivo alcanzado. Ciclo finalizado.'); return; }
 
@@ -269,7 +279,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && p === '/') {
     fs.readFile(INDEX_HTML, (err, buf) => {
       if (err) { res.writeHead(500); res.end('index.html no encontrado'); return; }
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(buf);
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(buf);
     });
     return;
   }
