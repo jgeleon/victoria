@@ -44,10 +44,12 @@ export class VisaHttpClient {
   async checkAvailableDate(headers, scheduleId, facilityId) {
     const url = `${this.baseUri}/schedule/${scheduleId}/appointment/days/${facilityId}.json?appointments[expedite]=false`;
     
-    log(`[REQUEST] GET ${url}`);
+    log(`───────────────────────────────────────────`);
+    log(`📤 REQUEST  GET ${url}`);
     return this._jsonRequest(url, headers)
       .then(data => {
-        log(`[RESPONSE] ${JSON.stringify(data)}`);
+        log(`📥 RESPONSE (${data.length} fechas):\n${JSON.stringify(data, null, 2)}`);
+        log(`───────────────────────────────────────────`);
         return data.map(item => item.date);
       });
   }
@@ -55,10 +57,12 @@ export class VisaHttpClient {
   async checkAvailableTime(headers, scheduleId, facilityId, date) {
     const url = `${this.baseUri}/schedule/${scheduleId}/appointment/times/${facilityId}.json?date=${date}&appointments[expedite]=false`;
     
-    log(`[REQUEST] GET ${url}`);
+    log(`───────────────────────────────────────────`);
+    log(`📤 REQUEST  GET ${url}`);
     return this._jsonRequest(url, headers)
       .then(data => {
-        log(`[RESPONSE] ${JSON.stringify(data)}`);
+        log(`📥 RESPONSE (horarios para ${date}):\n${JSON.stringify(data, null, 2)}`);
+        log(`───────────────────────────────────────────`);
         return data['business_times'][0] || data['available_times'][0];
       });
   }
