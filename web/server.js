@@ -1,9 +1,10 @@
-// Servidor web local para US Visa Bot
-// - No usa .env: credenciales y refresh delay se piden en el formulario.
-// - Valores FIJOS para todas las sesiones: LOCALE, COUNTRY_CODE, FACILITY_ID.
-// - SESIONES agrupan EJECUCIONES. Se permiten VARIAS ejecuciones en paralelo
-//   (una activa por sesión, pero distintas sesiones a la vez).
-// - Historial y logs por ejecución en disco; logs en vivo por SSE.
+// Servidor web local para US Visa Bot — Dashboard de órdenes
+// - Cada ORDEN guarda la config completa de un cliente (cliente, email,
+//   contraseña, schedule, fechas) en disco local (web/data/orders.json,
+//   ignorado por git) para iniciarse con un clic.
+// - Valores FIJOS para todas las órdenes: LOCALE, COUNTRY_CODE, FACILITY_ID.
+// - Una ejecución por orden; varias órdenes pueden correr en paralelo.
+// - Logs por ejecución en disco y en vivo por SSE. Sin login.
 // Solo módulos nativos de Node.
 import http from 'node:http';
 import fs from 'node:fs';
@@ -16,48 +17,41 @@ const PROJECT_ROOT = path.resolve(__dirname, '..');
 const INDEX_JS = path.join(PROJECT_ROOT, 'src', 'index.js');
 const INDEX_HTML = path.join(__dirname, 'index.html');
 const DATA_DIR = path.join(__dirname, 'data');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 const PORT = Number(process.env.GUI_PORT || 4321);
 
 const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
-const ASK_KEYS = [
-  { key: 'EMAIL', secret: false },
-  { key: 'PASSWORD', secret: true },
-  { key: 'SCHEDULE_ID', secret: false },
-  { key: 'REFRESH_DELAY', secret: false },
-];
 
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 
-const procs = new Map();     // runId -> proceso hijo en ejecución
-let sessions = [];
-const clients = new Set();
+const procs = new Map();   // runId -> proceso hijo
+let orders = [];
+const clients = new Set(); // conexiones SSE
 
 // ---------------- persistencia ----------------
-function loadSessions() {
-  try { sessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { sessions = []; }
-  if (!Array.isArray(sessions)) sessions = [];
-  // al arrancar, ninguna ejecución sigue viva: normaliza estados colgados
-  for (const s of sessions) for (const r of s.runs) if (r.status === 'running') { r.status = 'stopped'; if (!r.endedAt) r.endedAt = r.startedAt; }
+function loadOrders() {
+  try { orders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch { orders = []; }
+  if (!Array.isArray(orders)) orders = [];
+  for (const o of orders) {
+    if (o.run && o.run.status === 'running' && !procs.has(o.run.id)) { o.run.status = 'stopped'; if (!o.run.endedAt) o.run.endedAt = o.run.startedAt; }
+  }
 }
-function saveSessions() { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2)); }
+function saveOrders() { fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2)); }
 function genId(prefix) { return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
-function findSession(id) { return sessions.find((s) => s.id === id); }
-function findRun(runId) {
-  for (const s of sessions) { const r = s.runs.find((x) => x.id === runId); if (r) return { session: s, run: r }; }
-  return null;
-}
-function sessionHasActiveRun(session) { return session.runs.some((r) => procs.has(r.id)); }
+function findOrder(id) { return orders.find((o) => o.id === id); }
+function findOrderByRun(runId) { return orders.find((o) => o.run && o.run.id === runId); }
+function orderRunning(o) { return !!(o.run && procs.has(o.run.id)); }
 function logFile(runId) { return path.join(LOGS_DIR, `${runId}.jsonl`); }
 
-function getDefaults() {
-  let latest = null;
-  for (const s of sessions) for (const r of s.runs) if (!latest || r.startedAt > latest.startedAt) latest = r;
+// Vista pública de una orden (sin contraseña)
+function publicOrder(o) {
   return {
-    EMAIL: latest?.params?.email || '',
-    SCHEDULE_ID: latest?.params?.scheduleId || '',
-    REFRESH_DELAY: latest?.params?.refreshDelay || '3',
+    id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
+    refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min,
+    dryRun: o.dryRun, hasPassword: !!o.password,
+    running: orderRunning(o),
+    run: o.run ? { id: o.run.id, status: orderRunning(o) ? 'running' : o.run.status, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null,
   };
 }
 
@@ -79,52 +73,49 @@ function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) { try { res.write(payload); } catch { /* cerrado */ } }
 }
-function statusPayload() { return { running: procs.size > 0, runningRunIds: [...procs.keys()] }; }
-function broadcastStatus() { broadcast('status', statusPayload()); }
+function runningRunIds() { return [...procs.keys()]; }
+function broadcastState() { broadcast('state', { runningRunIds: runningRunIds() }); }
+
+// ---------------- validación ----------------
+function validateOrder(b, { partial = false } = {}) {
+  const errs = [];
+  const isDate = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (!partial || b.cliente !== undefined) if (!(b.cliente || '').trim()) errs.push('Cliente');
+  if (!partial || b.email !== undefined) if (!(b.email || '').trim()) errs.push('Email');
+  if (!partial || b.scheduleId !== undefined) if (!(b.scheduleId || '').trim()) errs.push('Schedule ID');
+  if (!partial || b.current !== undefined) if (!isDate((b.current || '').trim())) errs.push('Fecha actual (YYYY-MM-DD)');
+  return errs;
+}
 
 // ---------------- control del bot ----------------
-function startBot(params) {
-  const session = findSession(params.sessionId);
-  if (!session) return { ok: false, error: 'Selecciona o crea una sesión primero.' };
-  if (sessionHasActiveRun(session)) return { ok: false, error: 'Esta sesión ya tiene una ejecución en curso. Deténla o usa otra sesión.' };
+function startOrder(id) {
+  const o = findOrder(id);
+  if (!o) return { ok: false, error: 'Orden no encontrada.' };
+  if (orderRunning(o)) return { ok: false, error: 'Esta orden ya está en ejecución.' };
+  if (!o.password) return { ok: false, error: 'Esta orden no tiene contraseña guardada. Edítala para agregarla.' };
+  const errs = validateOrder(o);
+  if (errs.length) return { ok: false, error: 'Faltan datos en la orden: ' + errs.join(', ') + '.' };
 
-  const current = (params.current || '').trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(current)) return { ok: false, error: 'La fecha actual (-c) es obligatoria (formato YYYY-MM-DD).' };
+  const args = [INDEX_JS, '-c', o.current];
+  if ((o.target || '').trim()) args.push('-t', o.target.trim());
+  if ((o.min || '').trim()) args.push('-m', o.min.trim());
+  if (o.dryRun) args.push('--dry-run');
 
-  const creds = params.creds || {};
-  const email = (creds.EMAIL || '').trim();
-  const password = creds.PASSWORD || '';
-  const scheduleId = (creds.SCHEDULE_ID || '').trim();
-  const refreshDelay = (creds.REFRESH_DELAY || '').trim() || '3';
-  const missing = [];
-  if (!email) missing.push('Email');
-  if (!password) missing.push('Contraseña');
-  if (!scheduleId) missing.push('Schedule ID');
-  if (missing.length) return { ok: false, error: 'Faltan datos obligatorios: ' + missing.join(', ') + '.' };
+  const childEnv = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
 
-  const runParams = { current, target: (params.target || '').trim(), min: (params.min || '').trim(), dryRun: !!params.dryRun, email, scheduleId, refreshDelay };
-  const args = [INDEX_JS, '-c', runParams.current];
-  if (runParams.target) args.push('-t', runParams.target);
-  if (runParams.min) args.push('-m', runParams.min);
-  if (runParams.dryRun) args.push('--dry-run');
-
-  const childEnv = { ...process.env, ...STATIC_ENV, EMAIL: email, PASSWORD: password, SCHEDULE_ID: scheduleId, REFRESH_DELAY: refreshDelay };
-
-  // Una sola ejecución por sesión: elimina la anterior (ya validado que no está activa).
-  for (const old of session.runs) { try { fs.unlinkSync(logFile(old.id)); } catch { try { fs.writeFileSync(logFile(old.id), ''); } catch { /* noop */ } } }
-  session.runs = [];
-
-  const run = { id: genId('run'), startedAt: Date.now(), endedAt: null, status: 'running', params: runParams, command: `node src/index.js ${args.slice(1).join(' ')}` };
-  session.runs.push(run);
-  saveSessions();
+  // Una ejecución por orden: descarta la anterior
+  if (o.run) { try { fs.unlinkSync(logFile(o.run.id)); } catch { try { fs.writeFileSync(logFile(o.run.id), ''); } catch { /* noop */ } } }
+  const run = { id: genId('run'), startedAt: Date.now(), endedAt: null, status: 'running', command: `node src/index.js ${args.slice(1).join(' ')}` };
+  o.run = run;
+  saveOrders();
 
   appendLog(run.id, `$ ${run.command}`);
   appendLog(run.id, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
 
   const cp = spawn(process.execPath, args, { cwd: PROJECT_ROOT, env: childEnv });
   procs.set(run.id, cp);
-  broadcast('runstart', { sessionId: session.id, run });
-  broadcastStatus();
+  broadcast('orderupdate', { order: publicOrder(o) });
+  broadcastState();
 
   let outBuf = '', errBuf = '';
   const handle = (chunk, isErr) => {
@@ -136,28 +127,29 @@ function startBot(params) {
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
-  cp.on('exit', (code, signal) => {
+  const finish = (status, msg) => {
     if (outBuf) appendLog(run.id, outBuf);
     if (errBuf) appendLog(run.id, `[err] ${errBuf}`);
-    if (signal === 'SIGTERM') { run.status = 'stopped'; appendLog(run.id, 'Ejecución detenida por el usuario.'); }
-    else if (code === 0) { run.status = 'finished'; appendLog(run.id, 'Ejecución finalizada correctamente (objetivo alcanzado).'); }
-    else { run.status = 'error'; appendLog(run.id, `Ejecución terminó con código ${code}.`); }
-    run.endedAt = Date.now();
-    procs.delete(run.id); saveSessions();
-    broadcast('runend', { sessionId: session.id, run }); broadcastStatus();
+    if (msg) appendLog(run.id, msg);
+    run.status = status; run.endedAt = Date.now();
+    procs.delete(run.id); saveOrders();
+    broadcast('orderupdate', { order: publicOrder(o) });
+    broadcastState();
+  };
+  cp.on('exit', (code, signal) => {
+    if (signal === 'SIGTERM') finish('stopped', 'Ejecución detenida por el usuario.');
+    else if (code === 0) finish('finished', 'Ejecución finalizada correctamente (objetivo alcanzado).');
+    else finish('error', `Ejecución terminó con código ${code}.`);
   });
-  cp.on('error', (err) => {
-    appendLog(run.id, `Error al lanzar el bot: ${err.message}`);
-    run.status = 'error'; run.endedAt = Date.now();
-    procs.delete(run.id); saveSessions();
-    broadcast('runend', { sessionId: session.id, run }); broadcastStatus();
-  });
+  cp.on('error', (err) => finish('error', `Error al lanzar el bot: ${err.message}`));
 
-  return { ok: true, runId: run.id, sessionId: session.id };
+  return { ok: true, order: publicOrder(o) };
 }
-function stopBot(runId) {
-  const cp = procs.get(runId);
-  if (!cp) return { ok: false, error: 'Esa ejecución no está en curso.' };
+function stopOrder(id) {
+  const o = findOrder(id);
+  if (!o || !o.run) return { ok: false, error: 'Orden no encontrada.' };
+  const cp = procs.get(o.run.id);
+  if (!cp) return { ok: false, error: 'Esta orden no está en ejecución.' };
   cp.kill('SIGTERM');
   return { ok: true };
 }
@@ -171,7 +163,21 @@ function readBody(req) {
     req.on('end', () => { try { resolve(JSON.parse(data || '{}')); } catch { resolve({}); } });
   });
 }
-function sendResult(res, result) { sendJSON(res, result.ok ? 200 : 400, result); }
+function sendResult(res, r) { sendJSON(res, r.ok ? 200 : 400, r); }
+
+function applyFields(o, b, { isNew }) {
+  if (b.cliente !== undefined) o.cliente = String(b.cliente).trim();
+  if (b.email !== undefined) o.email = String(b.email).trim();
+  if (b.scheduleId !== undefined) o.scheduleId = String(b.scheduleId).trim();
+  if (b.refreshDelay !== undefined) o.refreshDelay = String(b.refreshDelay).trim() || '3';
+  if (b.current !== undefined) o.current = String(b.current).trim();
+  if (b.target !== undefined) o.target = String(b.target).trim();
+  if (b.min !== undefined) o.min = String(b.min).trim();
+  if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
+  // contraseña: en edición solo se cambia si viene con valor; en alta se toma tal cual
+  if (isNew) o.password = b.password || '';
+  else if (b.password) o.password = b.password;
+}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -185,61 +191,71 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === 'GET' && p === '/api/config') {
-    const defaults = getDefaults();
-    const askFields = ASK_KEYS.map((f) => ({ key: f.key, secret: f.secret, value: f.secret ? '' : (defaults[f.key] || '') }));
-    sendJSON(res, 200, { askFields, static: STATIC_ENV, sessions, ...statusPayload() });
+  if (req.method === 'GET' && p === '/api/state') {
+    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningRunIds: runningRunIds() });
     return;
   }
 
-  if (req.method === 'GET' && p === '/api/sessions') { sendJSON(res, 200, { sessions, ...statusPayload() }); return; }
-
-  if (req.method === 'POST' && p === '/api/sessions') {
-    const body = await readBody(req);
-    const name = (body.name || '').trim() || `Sesión ${sessions.length + 1}`;
-    const session = { id: genId('ses'), name, createdAt: Date.now(), runs: [] };
-    sessions.unshift(session); saveSessions();
-    sendJSON(res, 200, { ok: true, session });
+  if (req.method === 'GET' && p === '/api/order') {
+    const o = findOrder(url.searchParams.get('id'));
+    if (!o) return sendJSON(res, 404, { ok: false, error: 'Orden no encontrada' });
+    // incluye contraseña para prefilling del formulario de edición (uso local)
+    sendJSON(res, 200, { ok: true, order: { ...publicOrder(o), password: o.password || '' } });
     return;
   }
 
-  if (req.method === 'POST' && p === '/api/sessions/rename') {
-    const body = await readBody(req);
-    const s = findSession(body.id);
-    if (!s) return sendJSON(res, 404, { ok: false, error: 'Sesión no encontrada' });
-    s.name = (body.name || '').trim() || s.name; saveSessions();
-    sendJSON(res, 200, { ok: true, session: s });
+  if (req.method === 'POST' && p === '/api/orders') {
+    const b = await readBody(req);
+    const errs = validateOrder(b);
+    if (!(b.password || '').trim()) errs.push('Contraseña');
+    if (errs.length) return sendResult(res, { ok: false, error: 'Faltan datos: ' + errs.join(', ') + '.' });
+    const o = { id: genId('ord'), createdAt: Date.now(), run: null };
+    applyFields(o, b, { isNew: true });
+    orders.unshift(o); saveOrders();
+    sendJSON(res, 200, { ok: true, order: publicOrder(o) });
     return;
   }
 
-  if (req.method === 'POST' && p === '/api/sessions/delete') {
-    const body = await readBody(req);
-    const s = findSession(body.id);
-    if (!s) return sendJSON(res, 404, { ok: false, error: 'Sesión no encontrada' });
-    if (sessionHasActiveRun(s)) return sendJSON(res, 400, { ok: false, error: 'Detén la ejecución en curso antes de borrar esta sesión.' });
-    for (const r of s.runs) { try { fs.unlinkSync(logFile(r.id)); } catch { try { fs.writeFileSync(logFile(r.id), ''); } catch { /* noop */ } } }
-    sessions = sessions.filter((x) => x.id !== s.id); saveSessions();
+  if (req.method === 'POST' && p === '/api/orders/update') {
+    const b = await readBody(req);
+    const o = findOrder(b.id);
+    if (!o) return sendJSON(res, 404, { ok: false, error: 'Orden no encontrada' });
+    if (orderRunning(o)) return sendResult(res, { ok: false, error: 'Detén la orden antes de editarla.' });
+    const errs = validateOrder(b, { partial: true });
+    if (errs.length) return sendResult(res, { ok: false, error: 'Datos inválidos: ' + errs.join(', ') + '.' });
+    applyFields(o, b, { isNew: false });
+    saveOrders();
+    sendJSON(res, 200, { ok: true, order: publicOrder(o) });
+    return;
+  }
+
+  if (req.method === 'POST' && p === '/api/orders/delete') {
+    const b = await readBody(req);
+    const o = findOrder(b.id);
+    if (!o) return sendJSON(res, 404, { ok: false, error: 'Orden no encontrada' });
+    if (orderRunning(o)) return sendResult(res, { ok: false, error: 'Detén la orden antes de borrarla.' });
+    if (o.run) { try { fs.unlinkSync(logFile(o.run.id)); } catch { try { fs.writeFileSync(logFile(o.run.id), ''); } catch { /* noop */ } } }
+    orders = orders.filter((x) => x.id !== o.id); saveOrders();
     sendJSON(res, 200, { ok: true });
     return;
   }
 
+  if (req.method === 'POST' && p === '/api/start') { const b = await readBody(req); sendResult(res, startOrder(b.id)); return; }
+  if (req.method === 'POST' && p === '/api/stop') { const b = await readBody(req); sendResult(res, stopOrder(b.id)); return; }
+
   if (req.method === 'GET' && p === '/api/logs') {
     const runId = url.searchParams.get('runId');
-    const found = runId && findRun(runId);
-    if (!found) return sendJSON(res, 404, { ok: false, error: 'Ejecución no encontrada' });
+    if (!runId || !findOrderByRun(runId)) return sendJSON(res, 404, { ok: false, error: 'Ejecución no encontrada' });
     const { logs, total } = readLogs(runId, 1500);
-    sendJSON(res, 200, { ok: true, runId, run: found.run, logs, total });
+    sendJSON(res, 200, { ok: true, runId, logs, total });
     return;
   }
-
-  if (req.method === 'POST' && p === '/api/start') { sendResult(res, startBot(await readBody(req))); return; }
-  if (req.method === 'POST' && p === '/api/stop') { const b = await readBody(req); sendResult(res, stopBot(b.runId)); return; }
 
   if (req.method === 'GET' && p === '/api/stream') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     res.write('\n');
     clients.add(res);
-    res.write(`event: status\ndata: ${JSON.stringify(statusPayload())}\n\n`);
+    res.write(`event: state\ndata: ${JSON.stringify({ runningRunIds: runningRunIds() })}\n\n`);
     req.on('close', () => clients.delete(res));
     return;
   }
@@ -247,5 +263,5 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('Not found');
 });
 
-loadSessions();
-server.listen(PORT, () => { console.log(`\n  US Visa Bot GUI  →  http://localhost:${PORT}\n`); });
+loadOrders();
+server.listen(PORT, () => { console.log(`\n  US Visa Bot — Dashboard  →  http://localhost:${PORT}\n`); });
