@@ -41,6 +41,9 @@ const BOOKINGS_FILE = path.join(DATA_DIR, 'bookings.json');
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
 
 const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
+const useSupabase = !!(SUPABASE_URL && SUPABASE_KEY);
 
 
 // orderId -> controlador de ciclo { runId, child, phase, timers, flags, durationMs, intervalMs }
@@ -57,9 +60,34 @@ function loadOrders() {
     if (o.run && o.run.status === 'running' && !cycles.has(o.id)) { o.run.status = 'stopped'; if (!o.run.endedAt) o.run.endedAt = o.run.startedAt; }
   }
 }
-function saveOrders() { fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2)); }
+function saveOrders() { fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2)); sbQueue('orders'); }
 function loadBookings() { try { bookings = JSON.parse(fs.readFileSync(BOOKINGS_FILE, 'utf8')); } catch { bookings = []; } if (!Array.isArray(bookings)) bookings = []; }
-function saveBookings() { fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2)); }
+function saveBookings() { fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(bookings, null, 2)); sbQueue('bookings'); }
+
+// ---- Supabase (tabla kv: key text PK, value jsonb) vía REST ----
+async function sbGet(key) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/kv?key=eq.${encodeURIComponent(key)}&select=value`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
+  });
+  if (!r.ok) throw new Error('GET ' + r.status);
+  const rows = await r.json();
+  return rows[0] ? rows[0].value : null;
+}
+async function sbSet(key, value) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/kv`, {
+    method: 'POST',
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify([{ key, value }]),
+  });
+  if (!r.ok) throw new Error('POST ' + r.status + ' ' + (await r.text()));
+}
+let sbTimer = null; const sbPending = { orders: false, bookings: false };
+function sbQueue(which) { if (!useSupabase) return; sbPending[which] = true; if (sbTimer) return; sbTimer = setTimeout(sbFlush, 1200); }
+async function sbFlush() {
+  sbTimer = null; const p = { ...sbPending }; sbPending.orders = false; sbPending.bookings = false;
+  try { if (p.orders) await sbSet('orders', orders); if (p.bookings) await sbSet('bookings', bookings); }
+  catch (e) { console.warn('  ⚠️ Guardado en Supabase falló:', e.message); }
+}
 function genId(prefix) { return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
 function findOrder(id) { return orders.find((o) => o.id === id); }
 function findOrderByRun(runId) { return orders.find((o) => o.run && o.run.id === runId); }
@@ -291,7 +319,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && p.startsWith('/icons/')) { serveFile(res, path.join(__dirname, 'icons', path.basename(p)), 'image/png'); return; }
 
   if (req.method === 'GET' && p === '/api/state') {
-    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds(), persistent: dataPersistent, dataDir: DATA_DIR });
+    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds(), persistent: (useSupabase || dataPersistent), store: (useSupabase ? 'supabase' : (dataPersistent ? 'disk' : 'temp')) });
     return;
   }
 
@@ -390,6 +418,20 @@ function clearLogsHourly() {
 }
 setInterval(clearLogsHourly, 60 * 60 * 1000); // cada 1 hora
 
-loadOrders();
-loadBookings();
-server.listen(PORT, () => { console.log(`\n  US Visa Bot — Dashboard  →  http://localhost:${PORT}\n`); });
+async function init() {
+  loadOrders();
+  loadBookings();
+  if (useSupabase) {
+    try {
+      const o = await sbGet('orders');
+      if (Array.isArray(o)) { orders = o; for (const ord of orders) if (ord.run && ord.run.status === 'running') { ord.run.status = 'stopped'; if (!ord.run.endedAt) ord.run.endedAt = ord.run.startedAt; } }
+      const b = await sbGet('bookings');
+      if (Array.isArray(b)) bookings = b;
+      console.log('  \u2713 Almacenamiento: Supabase (datos persistentes).');
+    } catch (e) {
+      console.warn('  \u26a0\ufe0f No se pudo leer de Supabase:', e.message, '- se usan datos locales.');
+    }
+  }
+  server.listen(PORT, () => { console.log(`\n  US Visa Bot — Dashboard  →  http://localhost:${PORT}\n`); });
+}
+init();

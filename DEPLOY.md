@@ -92,3 +92,27 @@ git add -A && git commit -m "cambios" && git push
 ```
 Railway/Render redepliegan solos. Como los datos están en el volumen (`/data`),
 tus órdenes y logs **se conservan** entre despliegues.
+
+---
+
+## Persistencia gratis con Supabase (sin disco)
+
+Si no puedes usar un disco (plan gratis), guarda órdenes y citas en Supabase.
+
+1. Crea un proyecto gratis en https://supabase.com (New project).
+2. En **SQL Editor → New query**, ejecuta:
+   ```sql
+   create table if not exists kv (
+     key text primary key,
+     value jsonb
+   );
+   ```
+3. En **Project Settings → API** copia:
+   - **Project URL** → variable `SUPABASE_URL`
+   - Clave **service_role** (secreta, NO la anon) → variable `SUPABASE_KEY`
+4. En Render → tu servicio → **Environment**, agrega esas dos variables.
+5. Vuelve a desplegar. En los logs de arranque debe decir
+   `✓ Almacenamiento: Supabase (datos persistentes)`.
+
+Los logs siguen siendo temporales (se limpian cada hora); solo las órdenes y
+las citas se guardan en Supabase, así sobreviven a reinicios sin necesidad de disco.
