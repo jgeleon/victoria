@@ -212,6 +212,12 @@ function readBody(req) {
   });
 }
 function sendResult(res, r) { sendJSON(res, r.ok ? 200 : 400, r); }
+function serveFile(res, file, type) {
+  fs.readFile(file, (err, buf) => {
+    if (err) { res.writeHead(404); res.end('no encontrado'); return; }
+    res.writeHead(200, { 'Content-Type': type }); res.end(buf);
+  });
+}
 
 function applyFields(o, b, { isNew }) {
   if (b.cliente !== undefined) o.cliente = String(b.cliente).trim();
@@ -239,6 +245,10 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+
+  if (req.method === 'GET' && p === '/manifest.webmanifest') { serveFile(res, path.join(__dirname, 'manifest.webmanifest'), 'application/manifest+json; charset=utf-8'); return; }
+  if (req.method === 'GET' && p === '/sw.js') { serveFile(res, path.join(__dirname, 'sw.js'), 'application/javascript; charset=utf-8'); return; }
+  if (req.method === 'GET' && p.startsWith('/icons/')) { serveFile(res, path.join(__dirname, 'icons', path.basename(p)), 'image/png'); return; }
 
   if (req.method === 'GET' && p === '/api/state') {
     sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds() });
