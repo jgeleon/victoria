@@ -44,15 +44,23 @@ export class VisaHttpClient {
   async checkAvailableDate(headers, scheduleId, facilityId) {
     const url = `${this.baseUri}/schedule/${scheduleId}/appointment/days/${facilityId}.json?appointments[expedite]=false`;
     
+    log(`[REQUEST] GET ${url}`);
     return this._jsonRequest(url, headers)
-      .then(data => data.map(item => item.date));
+      .then(data => {
+        log(`[RESPONSE] ${JSON.stringify(data)}`);
+        return data.map(item => item.date);
+      });
   }
 
   async checkAvailableTime(headers, scheduleId, facilityId, date) {
     const url = `${this.baseUri}/schedule/${scheduleId}/appointment/times/${facilityId}.json?date=${date}&appointments[expedite]=false`;
     
+    log(`[REQUEST] GET ${url}`);
     return this._jsonRequest(url, headers)
-      .then(data => data['business_times'][0] || data['available_times'][0]);
+      .then(data => {
+        log(`[RESPONSE] ${JSON.stringify(data)}`);
+        return data['business_times'][0] || data['available_times'][0];
+      });
   }
 
   async book(headers, scheduleId, facilityId, date, time) {

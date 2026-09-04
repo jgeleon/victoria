@@ -2,7 +2,7 @@ import { Bot } from '../lib/bot.js';
 import { getConfig } from '../lib/config.js';
 import { log, sleep, isSocketHangupError } from '../lib/utils.js';
 
-const COOLDOWN = 3600; // 1 hour in seconds
+const COOLDOWN = 30; // segundos de espera solo tras un error de conexión (socket hang up)
 
 export async function botCommand(options) {
   const config = getConfig();
@@ -54,7 +54,7 @@ export async function botCommand(options) {
         }
       }
 
-      // Sin delay: vuelve a consultar de inmediato tras cada respuesta (positiva o negativa)
+      await sleep(config.refreshDelay);
     }
   } catch (err) {
     if (isSocketHangupError(err)) {
