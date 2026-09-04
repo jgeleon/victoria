@@ -1,10 +1,11 @@
 // Servidor web local para US Visa Bot — Dashboard de órdenes
-// - Cada ORDEN guarda la config completa de un cliente (cliente, email,
-//   contraseña, schedule, fechas) en disco local (web/data/orders.json,
-//   ignorado por git) para iniciarse con un clic.
-// - Valores FIJOS para todas las órdenes: LOCALE, COUNTRY_CODE, FACILITY_ID.
-// - Una ejecución por orden; varias órdenes pueden correr en paralelo.
-// - Logs por ejecución en disco y en vivo por SSE. Sin login.
+// - Cada ORDEN guarda la config de un cliente (cliente, email, contraseña,
+//   schedule, fechas, y opcionalmente duración/intervalo de ciclo) en disco
+//   local (web/data/orders.json, ignorado por git) e inicia con un clic.
+// - Valores FIJOS para todas: LOCALE, COUNTRY_CODE, FACILITY_ID.
+// - CICLO por orden: corre durante 'duración' min, se detiene, y revive cada
+//   'intervalo' min, en bucle, hasta que el usuario lo detiene.
+// - Logs por orden en disco (continuos entre ciclos) y en vivo por SSE. Sin login.
 // Solo módulos nativos de Node.
 import http from 'node:http';
 import fs from 'node:fs';
@@ -25,33 +26,37 @@ const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
 
 fs.mkdirSync(LOGS_DIR, { recursive: true });
 
-const procs = new Map();   // runId -> proceso hijo
+// orderId -> controlador de ciclo { runId, child, phase, timers, flags, durationMs, intervalMs }
+const cycles = new Map();
 let orders = [];
-const clients = new Set(); // conexiones SSE
+const clients = new Set();
 
 // ---------------- persistencia ----------------
 function loadOrders() {
   try { orders = JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8')); } catch { orders = []; }
   if (!Array.isArray(orders)) orders = [];
   for (const o of orders) {
-    if (o.run && o.run.status === 'running' && !procs.has(o.run.id)) { o.run.status = 'stopped'; if (!o.run.endedAt) o.run.endedAt = o.run.startedAt; }
+    if (o.run && o.run.status === 'running' && !cycles.has(o.id)) { o.run.status = 'stopped'; if (!o.run.endedAt) o.run.endedAt = o.run.startedAt; }
   }
 }
 function saveOrders() { fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2)); }
 function genId(prefix) { return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`; }
 function findOrder(id) { return orders.find((o) => o.id === id); }
 function findOrderByRun(runId) { return orders.find((o) => o.run && o.run.id === runId); }
-function orderRunning(o) { return !!(o.run && procs.has(o.run.id)); }
+function orderRunning(o) { return cycles.has(o.id); }
 function logFile(runId) { return path.join(LOGS_DIR, `${runId}.jsonl`); }
+function numOrEmpty(v) { const n = parseFloat(v); return isFinite(n) && n > 0 ? n : 0; }
 
-// Vista pública de una orden (sin contraseña)
 function publicOrder(o) {
+  const ctrl = cycles.get(o.id);
+  let runStatus = o.run ? o.run.status : null;
+  if (o.run && ctrl) runStatus = ctrl.phase; // 'running' | 'paused'
   return {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
-    refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min,
-    dryRun: o.dryRun, hasPassword: !!o.password,
-    running: orderRunning(o),
-    run: o.run ? { id: o.run.id, status: orderRunning(o) ? 'running' : o.run.status, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null,
+    refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
+    durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
+    hasPassword: !!o.password, running: orderRunning(o),
+    run: o.run ? { id: o.run.id, status: runStatus, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null,
   };
 }
 
@@ -73,8 +78,9 @@ function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) { try { res.write(payload); } catch { /* cerrado */ } }
 }
-function runningRunIds() { return [...procs.keys()]; }
-function broadcastState() { broadcast('state', { runningRunIds: runningRunIds() }); }
+function runningOrderIds() { return [...cycles.keys()]; }
+function broadcastState() { broadcast('state', { runningOrderIds: runningOrderIds() }); }
+function pushOrderUpdate(o) { broadcast('orderupdate', { order: publicOrder(o) }); }
 
 // ---------------- validación ----------------
 function validateOrder(b, { partial = false } = {}) {
@@ -87,7 +93,16 @@ function validateOrder(b, { partial = false } = {}) {
   return errs;
 }
 
-// ---------------- control del bot ----------------
+// ---------------- supervisor de ciclos ----------------
+function spawnChild(o) {
+  const args = [INDEX_JS, '-c', o.current];
+  if ((o.target || '').trim()) args.push('-t', o.target.trim());
+  if ((o.min || '').trim()) args.push('-m', o.min.trim());
+  if (o.dryRun) args.push('--dry-run');
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
+  return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
+}
+
 function startOrder(id) {
   const o = findOrder(id);
   if (!o) return { ok: false, error: 'Orden no encontrada.' };
@@ -96,61 +111,92 @@ function startOrder(id) {
   const errs = validateOrder(o);
   if (errs.length) return { ok: false, error: 'Faltan datos en la orden: ' + errs.join(', ') + '.' };
 
-  const args = [INDEX_JS, '-c', o.current];
-  if ((o.target || '').trim()) args.push('-t', o.target.trim());
-  if ((o.min || '').trim()) args.push('-m', o.min.trim());
-  if (o.dryRun) args.push('--dry-run');
-
-  const childEnv = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
-
-  // Una ejecución por orden: descarta la anterior
+  // Log continuo por sesión de ciclo: nuevo run.id, se descarta el anterior
   if (o.run) { try { fs.unlinkSync(logFile(o.run.id)); } catch { try { fs.writeFileSync(logFile(o.run.id), ''); } catch { /* noop */ } } }
-  const run = { id: genId('run'), startedAt: Date.now(), endedAt: null, status: 'running', command: `node src/index.js ${args.slice(1).join(' ')}` };
-  o.run = run;
+  const runId = genId('run');
+  o.run = { id: runId, startedAt: Date.now(), endedAt: null, status: 'running' };
+
+  const durationMs = numOrEmpty(o.durationMin) * 60000;
+  const intervalMs = numOrEmpty(o.intervalMin) * 60000;
+  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, durationMs, intervalMs, cycleStart: 0 };
+  cycles.set(o.id, ctrl);
   saveOrders();
 
-  appendLog(run.id, `$ ${run.command}`);
-  appendLog(run.id, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
+  appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
+  if (durationMs > 0 && intervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
+  else if (durationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
 
-  const cp = spawn(process.execPath, args, { cwd: PROJECT_ROOT, env: childEnv });
-  procs.set(run.id, cp);
-  broadcast('orderupdate', { order: publicOrder(o) });
-  broadcastState();
+  runCycle(o, ctrl);
+  pushOrderUpdate(o); broadcastState();
+  return { ok: true, order: publicOrder(o) };
+}
+
+function runCycle(o, ctrl) {
+  if (ctrl.userStopped) return;
+  const { cp, command } = spawnChild(o);
+  ctrl.child = cp; ctrl.phase = 'running'; ctrl.cycleStart = Date.now();
+  appendLog(ctrl.runId, `$ ${command}`);
+  appendLog(ctrl.runId, `▶ Ciclo iniciado${ctrl.durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
+  pushOrderUpdate(o);
+
+  if (ctrl.durationMs > 0) {
+    ctrl.durationTimer = setTimeout(() => { if (ctrl.child) { ctrl.durationHit = true; ctrl.child.kill('SIGTERM'); } }, ctrl.durationMs);
+  }
 
   let outBuf = '', errBuf = '';
   const handle = (chunk, isErr) => {
     let buf = (isErr ? errBuf : outBuf) + chunk.toString();
     const parts = buf.split(/\r?\n/); buf = parts.pop();
-    for (const l of parts) appendLog(run.id, isErr ? `[err] ${l}` : l);
+    for (const l of parts) appendLog(ctrl.runId, isErr ? `[err] ${l}` : l);
     if (isErr) errBuf = buf; else outBuf = buf;
   };
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
-  const finish = (status, msg) => {
-    if (outBuf) appendLog(run.id, outBuf);
-    if (errBuf) appendLog(run.id, `[err] ${errBuf}`);
-    if (msg) appendLog(run.id, msg);
-    run.status = status; run.endedAt = Date.now();
-    procs.delete(run.id); saveOrders();
-    broadcast('orderupdate', { order: publicOrder(o) });
-    broadcastState();
-  };
   cp.on('exit', (code, signal) => {
-    if (signal === 'SIGTERM') finish('stopped', 'Ejecución detenida por el usuario.');
-    else if (code === 0) finish('finished', 'Ejecución finalizada correctamente (objetivo alcanzado).');
-    else finish('error', `Ejecución terminó con código ${code}.`);
-  });
-  cp.on('error', (err) => finish('error', `Error al lanzar el bot: ${err.message}`));
+    if (outBuf) appendLog(ctrl.runId, outBuf);
+    if (errBuf) appendLog(ctrl.runId, `[err] ${errBuf}`);
+    ctrl.child = null;
+    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    ctrl.durationHit = false;
 
-  return { ok: true, order: publicOrder(o) };
+    if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
+    if (code === 0) { endCycle(o, ctrl, 'finished', '✅ Objetivo alcanzado. Ciclo finalizado.'); return; }
+
+    // El ciclo terminó (por duración o por sí solo). ¿Reprogramar?
+    if (ctrl.intervalMs > 0) {
+      const wait = Math.max(0, ctrl.intervalMs - (Date.now() - ctrl.cycleStart));
+      ctrl.phase = 'paused';
+      appendLog(ctrl.runId, `⏸ Ciclo detenido. Revive en ${Math.round(wait / 1000)} s…`);
+      pushOrderUpdate(o); broadcastState();
+      ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; runCycle(o, ctrl); pushOrderUpdate(o); broadcastState(); }, wait);
+    } else {
+      // duración sin intervalo: cae y queda detenida
+      endCycle(o, ctrl, 'stopped', '⏹ Tiempo de ejecución cumplido. Detenida.');
+    }
+  });
 }
+
+function endCycle(o, ctrl, status, msg) {
+  if (msg) appendLog(ctrl.runId, msg);
+  if (ctrl.durationTimer) clearTimeout(ctrl.durationTimer);
+  if (ctrl.pauseTimer) clearTimeout(ctrl.pauseTimer);
+  cycles.delete(o.id);
+  if (o.run) { o.run.status = status; o.run.endedAt = Date.now(); }
+  saveOrders();
+  pushOrderUpdate(o); broadcastState();
+}
+
 function stopOrder(id) {
   const o = findOrder(id);
-  if (!o || !o.run) return { ok: false, error: 'Orden no encontrada.' };
-  const cp = procs.get(o.run.id);
-  if (!cp) return { ok: false, error: 'Esta orden no está en ejecución.' };
-  cp.kill('SIGTERM');
+  if (!o) return { ok: false, error: 'Orden no encontrada.' };
+  const ctrl = cycles.get(o.id);
+  if (!ctrl) return { ok: false, error: 'Esta orden no está en ejecución.' };
+  ctrl.userStopped = true;
+  if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+  if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+  if (ctrl.child) { ctrl.child.kill('SIGTERM'); }        // el exit handler llama endCycle
+  else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa
   return { ok: true };
 }
 
@@ -174,7 +220,8 @@ function applyFields(o, b, { isNew }) {
   if (b.target !== undefined) o.target = String(b.target).trim();
   if (b.min !== undefined) o.min = String(b.min).trim();
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
-  // contraseña: en edición solo se cambia si viene con valor; en alta se toma tal cual
+  if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
+  if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
   if (isNew) o.password = b.password || '';
   else if (b.password) o.password = b.password;
 }
@@ -192,14 +239,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && p === '/api/state') {
-    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningRunIds: runningRunIds() });
+    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds() });
     return;
   }
 
   if (req.method === 'GET' && p === '/api/order') {
     const o = findOrder(url.searchParams.get('id'));
     if (!o) return sendJSON(res, 404, { ok: false, error: 'Orden no encontrada' });
-    // incluye contraseña para prefilling del formulario de edición (uso local)
     sendJSON(res, 200, { ok: true, order: { ...publicOrder(o), password: o.password || '' } });
     return;
   }
@@ -255,7 +301,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     res.write('\n');
     clients.add(res);
-    res.write(`event: state\ndata: ${JSON.stringify({ runningRunIds: runningRunIds() })}\n\n`);
+    res.write(`event: state\ndata: ${JSON.stringify({ runningOrderIds: runningOrderIds() })}\n\n`);
     req.on('close', () => clients.delete(res));
     return;
   }
