@@ -54,7 +54,7 @@ export async function botCommand(options) {
         }
       }
 
-      await sleep(config.refreshDelay);
+      // Sin delay: vuelve a consultar de inmediato tras cada respuesta (positiva o negativa)
     }
   } catch (err) {
     if (isSocketHangupError(err)) {
