@@ -276,7 +276,7 @@ function render(){
       '<td><span class="badge '+st+'">'+EST_LABEL[st]+'</span>'+(o.dryRun?' <span class="badge finished" title="simulación">sim</span>':'')+cycleInfo+'</td>'+
       '<td class="cita">'+cita+'</td>'+
       '<td><div class="acts">'+
-        '<span class="ab view" data-view="'+o.id+'" data-run="'+runId+'" title="Ver logs">👁</span>'+
+        '<span class="ab view" data-viewlogs="'+o.id+'" data-run="'+runId+'" title="Ver logs">👁</span>'+
         '<span class="ab edit" data-edit="'+o.id+'" title="Editar"'+(o.running?' disabled':'')+'>✎</span>'+
         (o.running
           ? '<span class="ab stop" data-stop="'+o.id+'" title="Detener">■</span>'
@@ -293,7 +293,7 @@ function bindRowActions(){
   document.querySelectorAll('[data-stop]').forEach(el=>el.onclick=()=>act('/api/stop',{id:el.dataset.stop}));
   document.querySelectorAll('[data-edit]').forEach(el=>{if(el.hasAttribute('disabled'))return;el.onclick=()=>openEdit(el.dataset.edit);});
   document.querySelectorAll('[data-del]').forEach(el=>{if(el.hasAttribute('disabled'))return;el.onclick=()=>delOrder(el.dataset.del);});
-  document.querySelectorAll('[data-view]').forEach(el=>el.onclick=()=>openLogs(el.dataset.view,el.dataset.run));
+  document.querySelectorAll('[data-viewlogs]').forEach(el=>el.onclick=()=>openLogs(el.dataset.viewlogs,el.dataset.run));
 }
 async function act(urlp,body){
   const r=await fetch(urlp,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
