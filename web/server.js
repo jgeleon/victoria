@@ -67,9 +67,13 @@ function appendLog(runId, line) {
   try { fs.appendFileSync(logFile(runId), JSON.stringify(entry) + '\n'); } catch { /* noop */ }
   broadcast('log', { runId, ...entry });
 }
-function readLogs(runId) {
-  try { return fs.readFileSync(logFile(runId), 'utf8').split(/\n/).filter(Boolean).map((l) => JSON.parse(l)); }
-  catch { return []; }
+function readLogs(runId, limit = 0) {
+  try {
+    let lines = fs.readFileSync(logFile(runId), 'utf8').split(/\n/).filter(Boolean);
+    const total = lines.length;
+    if (limit > 0 && total > limit) lines = lines.slice(-limit);
+    return { logs: lines.map((l) => JSON.parse(l)), total };
+  } catch { return { logs: [], total: 0 }; }
 }
 function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -105,6 +109,10 @@ function startBot(params) {
   if (runParams.dryRun) args.push('--dry-run');
 
   const childEnv = { ...process.env, ...STATIC_ENV, EMAIL: email, PASSWORD: password, SCHEDULE_ID: scheduleId, REFRESH_DELAY: refreshDelay };
+
+  // Una sola ejecución por sesión: elimina la anterior (ya validado que no está activa).
+  for (const old of session.runs) { try { fs.unlinkSync(logFile(old.id)); } catch { try { fs.writeFileSync(logFile(old.id), ''); } catch { /* noop */ } } }
+  session.runs = [];
 
   const run = { id: genId('run'), startedAt: Date.now(), endedAt: null, status: 'running', params: runParams, command: `node src/index.js ${args.slice(1).join(' ')}` };
   session.runs.push(run);
@@ -219,7 +227,8 @@ const server = http.createServer(async (req, res) => {
     const runId = url.searchParams.get('runId');
     const found = runId && findRun(runId);
     if (!found) return sendJSON(res, 404, { ok: false, error: 'Ejecución no encontrada' });
-    sendJSON(res, 200, { ok: true, runId, run: found.run, logs: readLogs(runId) });
+    const { logs, total } = readLogs(runId, 1500);
+    sendJSON(res, 200, { ok: true, runId, run: found.run, logs, total });
     return;
   }
 

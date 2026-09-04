@@ -179,6 +179,7 @@ let sessions=[];
 let selectedSessionId=null;  // sesión donde caerá la próxima ejecución
 let selectedRunId=null;      // ejecución cuyos logs se muestran
 let runningRunIds=new Set();
+const MAX_LINES=600;  // tope de líneas visibles para que la página no se congele
 
 const RUN_LABEL={running:'En ejecución',stopped:'Detenida',finished:'Finalizada',error:'Error'};
 
@@ -267,7 +268,12 @@ async function selectRun(runId, sesId){
   const res=await fetch('/api/logs?runId='+encodeURIComponent(runId));
   const data=await res.json();
   consoleEl.innerHTML='';
-  if(data.ok && data.logs.length){ data.logs.forEach(addLog); }
+  if(data.ok && data.logs.length){
+    const total=data.total||data.logs.length;
+    const shown=data.logs.slice(-MAX_LINES);
+    if(total>shown.length) addLog({t:Date.now(),line:'… mostrando las últimas '+shown.length+' de '+total+' líneas'});
+    shown.forEach(addLog);
+  }
   else { consoleEl.innerHTML='<span class="empty">Esta ejecución no tiene logs.</span>'; }
 }
 function locateRun(runId){
@@ -291,8 +297,10 @@ function addLog(entry){
   div.innerHTML='<span class="ts">'+fmtTime(entry.t)+'</span><span class="msg"></span>';
   div.querySelector('.msg').textContent=line;
   consoleEl.appendChild(div);
+  trimConsole();
   if($('autoscroll').checked)consoleEl.scrollTop=consoleEl.scrollHeight;
 }
+function trimConsole(){ while(consoleEl.childElementCount>MAX_LINES) consoleEl.removeChild(consoleEl.firstChild); }
 function renderTable(t,kind,jsonStr){
   let data; try{ data=JSON.parse(jsonStr); }catch(e){ return false; }
   const wrap=document.createElement('div'); wrap.className='logline';
@@ -317,6 +325,7 @@ function renderTable(t,kind,jsonStr){
   html+='</div>';
   wrap.innerHTML=html;
   consoleEl.appendChild(wrap);
+  trimConsole();
   if($('autoscroll').checked)consoleEl.scrollTop=consoleEl.scrollHeight;
   return true;
 }
@@ -403,7 +412,7 @@ function connectStream(){
   es.addEventListener('runstart',(e)=>{
     const d=JSON.parse(e.data);
     const s=sessions.find(x=>x.id===d.sessionId);
-    if(s && !s.runs.some(r=>r.id===d.run.id)){s.runs.push(d.run);}
+    if(s){s.runs=[d.run];}
     runningRunIds.add(d.run.id);
     selectRun(d.run.id,d.sessionId);
   });

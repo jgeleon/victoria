@@ -3,6 +3,7 @@ import { getConfig } from '../lib/config.js';
 import { log, sleep, isSocketHangupError } from '../lib/utils.js';
 
 const COOLDOWN = 30; // segundos de espera solo tras un error de conexión (socket hang up)
+const RETRY_DELAY = 5; // segundos de espera antes de reintentar tras error de sesión/login (evita bucle a máxima velocidad)
 
 export async function botCommand(options) {
   const config = getConfig();
@@ -61,7 +62,8 @@ export async function botCommand(options) {
       log(`Socket hangup error: ${err.message}. Trying again after ${COOLDOWN} seconds...`);
       await sleep(COOLDOWN);
     } else {
-      log(`Session/authentication error: ${err.message}. Retrying immediately...`);
+      log(`Session/authentication error: ${err.message}. Reintentando en ${RETRY_DELAY} segundos...`);
+      await sleep(RETRY_DELAY);
     }
     return botCommand(options);
   }
