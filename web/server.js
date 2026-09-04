@@ -24,11 +24,13 @@ const PORT = Number(process.env.PORT || process.env.GUI_PORT || 4321);
 // escribir ahí (p. ej. falta montar el disco en la nube), cae a una temporal
 // para que el panel al menos arranque, avisando que NO será persistente.
 let DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+let dataPersistent = true;
 try {
   fs.mkdirSync(path.join(DATA_DIR, 'logs'), { recursive: true });
 } catch (e) {
   const fallback = path.join(os.tmpdir(), 'usvisabot-data');
   fs.mkdirSync(path.join(fallback, 'logs'), { recursive: true });
+  dataPersistent = false;
   console.warn(`\n  ⚠️  No se pudo escribir en DATA_DIR="${DATA_DIR}" (${e.code}).` +
     `\n      Usando carpeta temporal "${fallback}" — los datos NO serán persistentes.` +
     `\n      En Render: agrega un Disk con Mount Path = esa ruta (o "/data") y vuelve a desplegar.\n`);
@@ -289,7 +291,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && p.startsWith('/icons/')) { serveFile(res, path.join(__dirname, 'icons', path.basename(p)), 'image/png'); return; }
 
   if (req.method === 'GET' && p === '/api/state') {
-    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds() });
+    sendJSON(res, 200, { orders: orders.map(publicOrder), static: STATIC_ENV, runningOrderIds: runningOrderIds(), persistent: dataPersistent, dataDir: DATA_DIR });
     return;
   }
 

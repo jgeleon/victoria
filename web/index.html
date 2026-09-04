@@ -140,6 +140,8 @@
   #console tbody tr:nth-child(even){background:rgba(255,255,255,.03)}
   #console td .yes{color:var(--greenb)} #console td .no{color:var(--muted)}
   .empty{color:var(--muted);font-style:italic}
+  #persistWarn{background:rgba(229,83,75,.15);color:#ffb4ae;border-bottom:1px solid rgba(229,83,75,.5);padding:11px 24px;font-size:13px;font-weight:600}
+  #persistWarn b{color:#fff}
 </style>
 </head>
 <body>
@@ -153,6 +155,7 @@
   </aside>
 
   <main class="main">
+    <div id="persistWarn" hidden>⚠️ Almacenamiento TEMPORAL: las órdenes y las citas se BORRARÁN al reiniciar el servidor. Monta un disco en Render (Mount Path <b>/data</b>) y define <b>DATA_DIR=/data</b>.</div>
     <section id="viewOrders">
       <div class="topbar">
         <h1>Órdenes</h1>
@@ -427,6 +430,7 @@ function renderTable(t,kind,jsonStr){
 async function loadState(){
   const r=await fetch('/api/state'); const d=await r.json();
   orders=d.orders||[]; staticEnv=d.static||{}; runningRunIds=new Set(d.runningOrderIds||[]);
+  $('persistWarn').hidden = (d.persistent!==false);
   $('staticVals').innerHTML=Object.entries(staticEnv).map(([k,v])=>'<span>'+k+'=<b>'+esc(v)+'</b></span>').join('');
   render();
 }
