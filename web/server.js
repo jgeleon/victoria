@@ -418,6 +418,15 @@ function clearLogsHourly() {
 }
 setInterval(clearLogsHourly, 60 * 60 * 1000); // cada 1 hora
 
+// Latido a Supabase: una consulta mínima cada 6 h para que el proyecto gratis
+// no se pause por inactividad (se pausa tras ~7 días sin actividad).
+async function supabaseHeartbeat() {
+  if (!useSupabase) return;
+  try { await sbGet('__heartbeat__'); console.log('  \u2665 Latido a Supabase (mantiene el proyecto activo).'); }
+  catch (e) { console.warn('  \u26a0\ufe0f Latido a Supabase falló:', e.message); }
+}
+if (useSupabase) { setInterval(supabaseHeartbeat, 6 * 60 * 60 * 1000); setTimeout(supabaseHeartbeat, 30 * 1000); }
+
 async function init() {
   loadOrders();
   loadBookings();
