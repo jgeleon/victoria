@@ -237,6 +237,7 @@ const consoleEl=$('console');
 function esc(s){const d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
 function pad(n){return String(n).padStart(2,'0');}
 function fmtD(iso){ if(!iso||!/^\d{4}-\d{2}-\d{2}$/.test(iso))return null; const[y,m,d]=iso.split('-');return d+'.'+m+'.'+y; }
+function fmtDateTime(t){ try { return new Date(t).toLocaleString('es-PE', { hour12: false }); } catch { return ''; } }
 function fmtRange(o){
   const a=fmtD(o.min)||fmtD(o.current);
   const b=fmtD(o.target);
