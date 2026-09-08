@@ -1,8 +1,8 @@
 /**
- * Módulo de peticiones rotativas inteligentes:
- * - Mantiene una IP residencial fija y persistente (keepAlive) para máxima velocidad y estabilidad de sesión.
- * - Si detecta un bloqueo (HTTP 429, 403, 503) o error de red (ECONNRESET, ETIMEDOUT, socket hang up),
- *   destruye la conexión y rota automáticamente a una nueva IP limpia al instante.
+ * Módulo de peticiones rotativas sobre un Pool Fijo de Proxies Residenciales:
+ * - Cada request rota al siguiente proxy/slot del pool (Slot 1 -> Slot 2 -> ... -> Slot N).
+ * - Las mismas IPs/slots se reutilizan ordenadamente entre ejecuciones y sesiones.
+ * - Si un slot del pool recibe un bloqueo (429/403/503) o fallo de red, se salta de inmediato al siguiente slot.
  *
  * Uso CLI:  node src/lib/peticiones_rotativas.js <url> [n_peticiones]
  */
@@ -10,65 +10,130 @@
 import fetch from "node-fetch";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { fileURLToPath } from "node:url";
+import fs from "node:fs";
+import path from "node:path";
+import dotenv from "dotenv";
 import { log } from "./utils.js";
 
-// --- Proxy rotativo (Webshare Rotating Residential) -------------------------
-const USER = process.env.PROXY_USER || "dfcbaylc";
-const PASS = process.env.PROXY_PASS || "f22krtiwmj51";
-const PAIS = process.env.PROXY_COUNTRY || "GB"; // PAIS: GB, PE, US...
-const HOST = process.env.PROXY_HOST || "p.webshare.io:80";
+dotenv.config();
 
-export const PROXY_URL = process.env.PROXY_URL || `http://${USER}-${PAIS}-rotate:${PASS}@${HOST}`;
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = path.resolve(__dirname, "../..");
+const LOCAL_PROXIES_FILE = path.join(PROJECT_ROOT, "Webshare residential proxies.txt");
+const PROXY_LIST_URL = process.env.WEBSHARE_PROXY_LIST_URL || "";
+const POOL_SIZE = parseInt(process.env.PROXY_POOL_SIZE || "20", 10);
 
-// Agente persistente activo para reutilizar IP y reducir latencia
-let activeAgent = null;
+// Pool de proxies cargados en memoria y caché de agentes
+let proxyPool = [];
+const agentCache = new Map();
+let currentSlotIndex = 0;
 
 /**
- * Obtiene el agente HTTP proxy activo o crea uno nuevo con keepAlive: true
+ * Parsea una línea de proxy en formato host:port:user:pass a URL de proxy
  */
-export function getProxyAgent() {
-  if (!activeAgent) {
-    activeAgent = new HttpsProxyAgent(PROXY_URL, {
-      keepAlive: true,
-      keepAliveMsecs: 30000,
-      timeout: 15000
-    });
+function parseProxyLine(line) {
+  const parts = line.trim().split(":");
+  if (parts.length >= 4) {
+    const [host, port, user, pass] = parts;
+    return `http://${user}:${pass}@${host}:${port}`;
   }
-  return activeAgent;
+  return null;
 }
 
 /**
- * Fuerza el cambio inmediato a una nueva IP destruyendo la conexión actual.
- * @param {string} motivo - Razón del cambio para fines de registro
+ * Carga o descarga la lista de proxies para conformar el pool fijo
  */
-export function rotarIp(motivo = "") {
-  if (activeAgent) {
+export function initProxyPool() {
+  if (proxyPool.length > 0) return proxyPool;
+
+  let rawLines = [];
+
+  // 1. Intentar leer desde archivo local
+  if (fs.existsSync(LOCAL_PROXIES_FILE)) {
     try {
-      activeAgent.destroy();
-    } catch { /* noop */ }
-    activeAgent = null;
+      const content = fs.readFileSync(LOCAL_PROXIES_FILE, "utf8");
+      rawLines = content.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    } catch (e) {
+      log(`⚠️ No se pudo leer ${LOCAL_PROXIES_FILE}: ${e.message}`);
+    }
   }
-  if (motivo) {
-    log(`🔄 [Proxy] Rotando IP inmediatamente (${motivo})`);
+
+  // Parsear y limitar al tamaño del pool deseado
+  for (const line of rawLines) {
+    const parsed = parseProxyLine(line);
+    if (parsed) proxyPool.push(parsed);
+    if (proxyPool.length >= POOL_SIZE) break;
+  }
+
+  // Fallback si no hay lista
+  if (proxyPool.length === 0) {
+    const user = process.env.PROXY_USER || "dfcbaylc";
+    const pass = process.env.PROXY_PASS || "f22krtiwmj51";
+    const pais = process.env.PROXY_COUNTRY || "GB";
+    const host = process.env.PROXY_HOST || "p.webshare.io:80";
+    proxyPool.push(`http://${user}-${pais}-rotate:${pass}@${host}`);
+  }
+
+  return proxyPool;
+}
+
+/**
+ * Obtiene el agente HttpsProxyAgent para una URL de proxy con keepAlive
+ */
+function getAgentForProxy(proxyUrl) {
+  if (!agentCache.has(proxyUrl)) {
+    agentCache.set(
+      proxyUrl,
+      new HttpsProxyAgent(proxyUrl, {
+        keepAlive: true,
+        keepAliveMsecs: 30000,
+        timeout: 15000
+      })
+    );
+  }
+  return agentCache.get(proxyUrl);
+}
+
+/**
+ * Descarta un agente fallido para renovar su conexión
+ */
+function resetAgentForProxy(proxyUrl) {
+  if (agentCache.has(proxyUrl)) {
+    try {
+      agentCache.get(proxyUrl).destroy();
+    } catch { /* noop */ }
+    agentCache.delete(proxyUrl);
   }
 }
 
 /**
- * Realiza una petición HTTPS pasando por el proxy.
- * Reutiliza la IP para velocidad y rota instantáneamente ante bloqueos o fallos de red.
+ * Reinicia el puntero del pool al inicio (ej. al comenzar un nuevo ciclo)
+ */
+export function resetPoolIndex() {
+  currentSlotIndex = 0;
+}
+
+/**
+ * Realiza una petición HTTPS rotando secuencialmente sobre el pool fijo de proxies.
+ * Si un slot del pool es bloqueado, salta automáticamente al siguiente slot.
  *
  * @param {string} url - URL destino
  * @param {object} options - Opciones de fetch
- * @param {number} maxRetries - Intentos máximos en caso de bloqueo o error de red (default: 2)
+ * @param {number} maxRetries - Intentos máximos en caso de bloqueo o error de red (default: 3)
  * @returns {Promise<Response>} - Respuesta estándar de fetch
  */
-export async function fetchRotativo(url, options = {}, maxRetries = 2) {
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const agent = getProxyAgent();
+export async function fetchRotativo(url, options = {}, maxRetries = 3) {
+  const pool = initProxyPool();
 
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const slotNumber = (currentSlotIndex % pool.length) + 1;
+    const proxyUrl = pool[currentSlotIndex % pool.length];
+    currentSlotIndex = (currentSlotIndex + 1) % pool.length;
+
+    const agent = getAgentForProxy(proxyUrl);
     const headers = {
       ...options.headers,
-      'Connection': 'keep-alive'
+      "Connection": "keep-alive"
     };
 
     try {
@@ -78,28 +143,30 @@ export async function fetchRotativo(url, options = {}, maxRetries = 2) {
         agent
       });
 
-      // Si la respuesta indica bloqueo o rate-limit por parte del servidor:
+      // Si el servidor responde con bloqueo / rate-limit:
       if (res.status === 429 || res.status === 403 || res.status === 503) {
-        const razon = res.status === 429 
-          ? 'Límite de peticiones alcanzado (HTTP 429)' 
-          : res.status === 403 
-          ? 'Acceso denegado / Bloqueo (HTTP 403)' 
-          : 'Servicio no disponible (HTTP 503)';
+        const razon = res.status === 429
+          ? "Límite de peticiones alcanzado (HTTP 429)"
+          : res.status === 403
+          ? "Acceso denegado / Bloqueo (HTTP 403)"
+          : "Servicio no disponible (HTTP 503)";
 
-        log(`⚠️ IP bloqueada: ${razon}. Cambiando de IP inmediatamente...`);
-        rotarIp();
+        log(`⚠️ IP bloqueada en Slot ${slotNumber} (${razon}). Saltando al siguiente proxy del pool...`);
+        resetAgentForProxy(proxyUrl);
+
         if (attempt < maxRetries) {
-          log(`🔄 Reintentando petición con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
+          log(`🔄 Reintentando en siguiente slot del pool (intento ${attempt + 1}/${maxRetries})...`);
           continue;
         }
       }
 
       return res;
     } catch (err) {
-      log(`⚠️ Error de conexión en la IP actual (${err.message}). Cambiando de IP...`);
-      rotarIp();
+      log(`⚠️ Error de conexión en Slot ${slotNumber} (${err.message}). Saltando al siguiente proxy...`);
+      resetAgentForProxy(proxyUrl);
+
       if (attempt < maxRetries) {
-        log(`🔄 Reintentando petición con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
+        log(`🔄 Reintentando en siguiente slot del pool (intento ${attempt + 1}/${maxRetries})...`);
         continue;
       }
       throw err;
@@ -114,20 +181,19 @@ export default fetchRotativo;
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
   const url = process.argv[2] || "https://api.ipify.org";
-  const n = parseInt(process.argv[3] || "4", 10);
+  const n = parseInt(process.argv[3] || "6", 10);
+  const pool = initProxyPool();
 
-  console.log(`Probando peticiones a ${url} con IP persistente y rotación bajo demanda...`);
+  console.log(`Pool activo: ${pool.length} proxies.`);
+  console.log(`Probando ${n} peticiones en round-robin a ${url}...`);
+
   for (let i = 1; i <= n; i++) {
     try {
-      if (i === 3) {
-        console.log("-> Simulando rotación forzada en iteración 3...");
-        rotarIp("Prueba CLI");
-      }
       const res = await fetchRotativo(url);
       const body = (await res.text()).slice(0, 120);
-      console.log(`[${i}] ${res.status}  ${body}`);
+      console.log(`[Petición ${i}] HTTP ${res.status}  ${body}`);
     } catch (e) {
-      console.log(`[${i}] ERROR: ${e.message}`);
+      console.log(`[Petición ${i}] ERROR: ${e.message}`);
     }
   }
 }
