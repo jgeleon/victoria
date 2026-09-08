@@ -10,6 +10,8 @@ export class Bot {
 
   async initialize() {
     log('Initializing visa bot...');
+    const ip = await this.client.getPublicIp();
+    log(`🌐 IP de origen (saliente): ${ip || 'no disponible'}`);
     return await this.client.login();
   }
 

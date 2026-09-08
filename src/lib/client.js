@@ -92,6 +92,15 @@ export class VisaHttpClient {
     return this._submitFormWithRedirect(url, bookingHeaders, bookingData);
   }
 
+  // Devuelve la IP pública de salida del servidor (para registro/observabilidad).
+  async getPublicIp() {
+    try {
+      const r = await fetch('https://api.ipify.org?format=json', { headers: { Accept: 'application/json' } });
+      const j = await r.json();
+      return j.ip || null;
+    } catch { return null; }
+  }
+
   // Private request methods
   async _anonymousRequest(url, headers = {}) {
     return fetch(url, {
