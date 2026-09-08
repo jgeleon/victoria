@@ -80,18 +80,26 @@ export async function fetchRotativo(url, options = {}, maxRetries = 2) {
 
       // Si la respuesta indica bloqueo o rate-limit por parte del servidor:
       if (res.status === 429 || res.status === 403 || res.status === 503) {
-        rotarIp(`Status HTTP ${res.status}`);
+        const razon = res.status === 429 
+          ? 'Límite de peticiones alcanzado (HTTP 429)' 
+          : res.status === 403 
+          ? 'Acceso denegado / Bloqueo (HTTP 403)' 
+          : 'Servicio no disponible (HTTP 503)';
+
+        log(`⚠️ IP bloqueada: ${razon}. Cambiando de IP inmediatamente...`);
+        rotarIp();
         if (attempt < maxRetries) {
-          log(`🔁 Reintentando petición con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
+          log(`🔄 Reintentando petición con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
           continue;
         }
       }
 
       return res;
     } catch (err) {
-      rotarIp(`Fallo de conexión: ${err.message}`);
+      log(`⚠️ Error de conexión en la IP actual (${err.message}). Cambiando de IP...`);
+      rotarIp();
       if (attempt < maxRetries) {
-        log(`🔁 Reintentando petición tras error con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
+        log(`🔄 Reintentando petición con nueva IP (intento ${attempt + 1}/${maxRetries})...`);
         continue;
       }
       throw err;
