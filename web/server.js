@@ -343,8 +343,8 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && p === '/manifest.webmanifest') { serveFile(res, path.join(__dirname, 'manifest.webmanifest'), 'application/manifest+json; charset=utf-8'); return; }
   if (req.method === 'GET' && p === '/sw.js') { serveFile(res, path.join(__dirname, 'sw.js'), 'application/javascript; charset=utf-8'); return; }
-  if (req.method === 'GET' && (p.startsWith('/icons/') || p === '/bg.jpeg' || p === '/avatar.jpeg')) {
-    const filename = p.startsWith('/icons/') ? path.basename(p) : p.slice(1);
+  if (req.method === 'GET' && (p.startsWith('/icons/') || p === '/bg.jpeg' || p === '/avatar.jpeg' || p === '/favicon.ico')) {
+    const filename = (p === '/favicon.ico' || p === '/avatar.jpeg') ? 'avatar.jpeg' : (p === '/bg.jpeg' ? 'bg.jpeg' : path.basename(p));
     const filePath = path.join(__dirname, 'icons', filename);
     const ext = path.extname(filePath).toLowerCase();
     const mime = (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg' : (ext === '.webp' ? 'image/webp' : 'image/png');
