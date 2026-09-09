@@ -19,15 +19,15 @@
     --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;
+  body{margin:0;background:linear-gradient(rgba(10,14,20,.88), rgba(13,17,23,.94)), url('/icons/bg.jpeg') no-repeat center center fixed;background-size:cover;color:var(--text);height:100vh;overflow:hidden;
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5}
   .app{display:grid;grid-template-columns:230px 1fr;height:100vh}
   @media(max-width:820px){.app{grid-template-columns:1fr}.sidebar{display:none}}
 
   /* Sidebar */
-  .sidebar{background:var(--sidebar);border-right:1px solid var(--border);padding:18px 14px;display:flex;flex-direction:column;gap:6px}
+  .sidebar{background:rgba(10,14,20,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-right:1px solid rgba(43,51,61,.8);padding:18px 14px;display:flex;flex-direction:column;gap:6px}
   .brand{display:flex;align-items:center;gap:10px;padding:6px 8px 14px}
-  .brand .logo{font-size:26px}
+  .brand .logo-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;border:2px solid var(--accent);box-shadow:0 0 10px rgba(47,129,247,.45);flex-shrink:0}
   .brand .bt{font-weight:700;font-size:15px}
   .brand .bs{font-size:11px;color:var(--muted)}
   .navitem{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;color:var(--muted);cursor:pointer;font-weight:600;font-size:13.5px}
@@ -44,14 +44,14 @@
 
   /* Main */
   .main{overflow:auto;padding:0}
-  .topbar{display:flex;align-items:center;gap:14px;padding:18px 24px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--bg);z-index:3}
+  .topbar{display:flex;align-items:center;gap:14px;padding:18px 24px;border-bottom:1px solid rgba(43,51,61,.8);position:sticky;top:0;background:rgba(13,17,23,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);z-index:3}
   .topbar h1{margin:0;font-size:18px;font-weight:700}
   .topbar .sum{margin-left:auto;font-size:12.5px;color:var(--muted)}
   .topbar .sum b{color:var(--greenb)}
   .tablewrap{padding:14px 18px 40px;overflow-x:auto}
   table.orders{width:100%;border-collapse:separate;border-spacing:0 8px;min-width:900px}
   table.orders thead th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);padding:0 14px 4px;font-weight:600}
-  table.orders tbody tr{background:var(--panel)}
+  table.orders tbody tr{background:rgba(22,27,34,.82);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
   table.orders tbody td{padding:12px 14px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);vertical-align:middle}
   table.orders tbody td:first-child{border-left:1px solid var(--border);border-radius:10px 0 0 10px}
   table.orders tbody td:last-child{border-right:1px solid var(--border);border-radius:0 10px 10px 0}
@@ -89,7 +89,7 @@
   /* Modales */
   .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:20;padding:20px}
   .overlay.open{display:flex}
-  .modal{background:var(--panel);border:1px solid var(--border);border-radius:14px;width:100%;max-width:560px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
+  .modal{background:rgba(22,27,34,.94);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);border:1px solid var(--border);border-radius:14px;width:100%;max-width:560px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
   .modal.wide{max-width:920px}
   .mhead{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--border)}
   .mhead h3{margin:0;font-size:16px;font-weight:700}
@@ -147,7 +147,7 @@
 <body>
 <div class="app">
   <aside class="sidebar">
-    <div class="brand"><span class="logo">🤖</span><div><div class="bt">US Visa Bot</div><div class="bs">v2.5 · local</div></div></div>
+    <div class="brand"><img src="/icons/avatar.jpeg" class="logo-avatar" alt="Avatar" /><div><div class="bt">US Visa Bot</div><div class="bs">v2.5 · local</div></div></div>
     <div class="navitem active" data-view="orders"><span class="ic">📋</span> Órdenes</div>
     <div class="navitem" data-view="bookings"><span class="ic">🎫</span> Citas reservadas <span class="navcount" id="navBookings">0</span></div>
     <button class="side-new" id="btnNew">+ Nueva orden</button>
