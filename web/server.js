@@ -105,7 +105,6 @@ function publicOrder(o) {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
-    poolsCount: o.poolsCount || '2', poolSize: o.poolSize || '20',
     hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
@@ -163,28 +162,12 @@ function validateOrder(b, { partial = false } = {}) {
 }
 
 // ---------------- supervisor de ciclos ----------------
-function spawnChild(o, ctrl) {
+function spawnChild(o) {
   const args = [INDEX_JS, '-c', o.current];
   if ((o.target || '').trim()) args.push('-t', o.target.trim());
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
   if (o.dryRun) args.push('--dry-run');
-
-  const poolsCount = parseInt(o.poolsCount || process.env.PROXY_POOLS_COUNT || '2', 10);
-  const cycleCount = ctrl ? (ctrl.cycleCount || 1) : 1;
-  const poolIndex = ((cycleCount - 1) % poolsCount) + 1;
-  const poolSize = parseInt(o.poolSize || process.env.PROXY_POOL_SIZE || '20', 10);
-
-  const env = {
-    ...process.env,
-    ...STATIC_ENV,
-    EMAIL: o.email,
-    PASSWORD: o.password,
-    SCHEDULE_ID: o.scheduleId,
-    REFRESH_DELAY: (o.refreshDelay || '3'),
-    PROXY_POOLS_COUNT: String(poolsCount),
-    PROXY_POOL_INDEX: String(poolIndex),
-    PROXY_POOL_SIZE: String(poolSize)
-  };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -203,15 +186,11 @@ function startOrder(id) {
 
   const durationMs = numOrEmpty(o.durationMin) * 60000;
   const intervalMs = numOrEmpty(o.intervalMin) * 60000;
-  const poolsCount = parseInt(o.poolsCount || process.env.PROXY_POOLS_COUNT || '2', 10);
-  const poolSize = parseInt(o.poolSize || process.env.PROXY_POOL_SIZE || '20', 10);
-
-  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, durationMs, intervalMs, cycleStart: 0, cycleCount: 0 };
+  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, durationMs, intervalMs, cycleStart: 0 };
   cycles.set(o.id, ctrl);
   saveOrders();
 
   appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
-  appendLog(runId, `🌐 Configuración de Proxy: ${poolsCount} Pools de ${poolSize} IPs rotando por ciclo.`);
   if (durationMs > 0 && intervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
   else if (durationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
 
@@ -222,14 +201,10 @@ function startOrder(id) {
 
 function runCycle(o, ctrl) {
   if (ctrl.userStopped) return;
-  ctrl.cycleCount = (ctrl.cycleCount || 0) + 1;
-  const poolsCount = parseInt(o.poolsCount || process.env.PROXY_POOLS_COUNT || '2', 10);
-  const poolIndex = ((ctrl.cycleCount - 1) % poolsCount) + 1;
-
-  const { cp, command } = spawnChild(o, ctrl);
+  const { cp, command } = spawnChild(o);
   ctrl.child = cp; ctrl.phase = 'running'; ctrl.cycleStart = Date.now();
   appendLog(ctrl.runId, `$ ${command}`);
-  appendLog(ctrl.runId, `▶ Ciclo #${ctrl.cycleCount} iniciado${ctrl.durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''} — Usando Pool de IPs #${poolIndex} (de ${poolsCount})`);
+  appendLog(ctrl.runId, `▶ Ciclo iniciado${ctrl.durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
   pushOrderUpdate(o);
 
   if (ctrl.durationMs > 0) {
@@ -323,8 +298,6 @@ function applyFields(o, b, { isNew }) {
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
   if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
-  if (b.poolsCount !== undefined) o.poolsCount = String(b.poolsCount).trim() || '2';
-  if (b.poolSize !== undefined) o.poolSize = String(b.poolSize).trim() || '20';
   if (isNew) o.password = b.password || '';
   else if (b.password) o.password = b.password;
 }
