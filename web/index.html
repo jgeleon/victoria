@@ -206,6 +206,8 @@
         <div class="field"><label>Fecha mínima aceptable (-m)</label><input type="date" id="f_min" /></div>
         <div class="field"><label>Duración de ejecución (min)</label><input type="number" step="0.1" min="0" id="f_durationMin" placeholder="0 = sin límite" /></div>
         <div class="field"><label>Intervalo del ciclo (min)</label><input type="number" step="0.1" min="0" id="f_intervalMin" placeholder="0 = no repetir" /></div>
+        <div class="field"><label>Cantidad de Pools a rotar</label><input type="number" step="1" min="1" id="f_poolsCount" placeholder="2 (Pool 1 ➔ Pool 2 ➔ Pool 1...)" /></div>
+        <div class="field"><label>Tamaño de cada Pool (IPs)</label><input type="number" step="1" min="1" id="f_poolSize" placeholder="20" /></div>
         <div class="field full"><label class="check"><input type="checkbox" id="f_dryRun" /><span>Modo simulación (--dry-run)<small>Solo muestra qué reservaría, sin reservar</small></span></label></div>
       </div>
       <div class="staticInfo"><div class="staticTitle">Valores fijos (todas las órdenes)</div><div class="staticVals" id="staticVals"></div></div>
@@ -272,7 +274,7 @@ function render(){
       ? '<span class="done">¡Cita reservada!</span>'
       : (st==='finished' ? '<span class="done">Finalizada</span>' : '<span class="pend">Pendiente</span>');
     const cycleInfo = (o.durationMin||o.intervalMin)
-      ? '<small style="display:block;color:var(--muted);font-size:11px;margin-top:3px">♻ '+(o.durationMin||'∞')+'m / '+(o.intervalMin||'—')+'m</small>' : '';
+      ? '<small style="display:block;color:var(--muted);font-size:11px;margin-top:3px">♻ '+(o.durationMin||'∞')+'m / '+(o.intervalMin||'—')+'m · '+(o.poolsCount||'2')+' pools</small>' : '';
     const runId=o.run?o.run.id:'';
     const tr=document.createElement('tr');
     tr.innerHTML=
@@ -333,6 +335,8 @@ function fillForm(o){
   $('f_min').value=o?o.min||'':'';
   $('f_durationMin').value=o?(o.durationMin||''):'';
   $('f_intervalMin').value=o?(o.intervalMin||''):'';
+  $('f_poolsCount').value=o?(o.poolsCount||'2'):'2';
+  $('f_poolSize').value=o?(o.poolSize||'20'):'20';
   $('f_dryRun').checked=o?!!o.dryRun:false;
   $('f_password').type='password';$('f_pwtoggle').textContent='Ver';
   $('omBanner').style.display='none';
@@ -350,6 +354,7 @@ $('omSave').onclick=async()=>{
     scheduleId:$('f_scheduleId').value, refreshDelay:$('f_refreshDelay').value,
     current:$('f_current').value, target:$('f_target').value, min:$('f_min').value, dryRun:$('f_dryRun').checked,
     durationMin:$('f_durationMin').value, intervalMin:$('f_intervalMin').value,
+    poolsCount:$('f_poolsCount').value||'2', poolSize:$('f_poolSize').value||'20',
   };
   const urlp=id?'/api/orders/update':'/api/orders';
   const r=await fetch(urlp,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
