@@ -2,8 +2,7 @@ import { Bot } from '../lib/bot.js';
 import { getConfig } from '../lib/config.js';
 import { log, sleep, isSocketHangupError } from '../lib/utils.js';
 
-const COOLDOWN = 30; // segundos de espera solo tras un error de conexión (socket hang up)
-const RETRY_DELAY = 5; // segundos de espera antes de reintentar tras error de sesión/login (evita bucle a máxima velocidad)
+const RETRY_DELAY = 5; // segundos entre reintentos de login/sesión
 
 export async function botCommand(options) {
   const config = getConfig();
@@ -26,12 +25,19 @@ export async function botCommand(options) {
     log(`Minimum date: ${minDate}`);
   }
 
+  // Login inicial: reintentar indefinidamente hasta lograrlo (nunca detener por login)
   let sessionHeaders = null;
-  try {
-    sessionHeaders = await bot.initialize();
-  } catch (err) {
-    log(`🛑 DETENIDO POR BLOQUEO: Error al iniciar sesión (${err.message})`);
-    process.exit(2);
+  while (!sessionHeaders) {
+    try {
+      sessionHeaders = await bot.initialize();
+    } catch (err) {
+      if (err.isBlock) {
+        log(`🛑 DETENIDO POR BLOQUEO: Bloqueo al iniciar sesión (${err.message})`);
+        process.exit(2);
+      }
+      log(`⚠️ Login inicial fallido: ${err.message}. Reintentando en ${RETRY_DELAY} s...`);
+      await sleep(RETRY_DELAY);
+    }
   }
 
   while (true) {
@@ -46,13 +52,8 @@ export async function botCommand(options) {
         const booked = await bot.bookAppointment(sessionHeaders, availableDate);
 
         if (booked) {
-          // Update current date to the new available date
           currentBookedDate = availableDate;
-
-          options = {
-            ...options,
-            current: currentBookedDate
-          };
+          options = { ...options, current: currentBookedDate };
 
           if (targetDate && availableDate <= targetDate) {
             log(`Target date reached! Successfully booked appointment on ${availableDate}`);
@@ -63,21 +64,30 @@ export async function botCommand(options) {
 
       await sleep(config.refreshDelay);
     } catch (err) {
-      if (err.isSessionExpired || /sesión expirada|session|sign_in/i.test(err.message)) {
-        log(`⚠️ Sesión expirada del portal. Re-autenticando sesión automáticamente...`);
-        try {
-          await sleep(2);
-          sessionHeaders = await bot.initialize();
-          continue;
-        } catch (loginErr) {
-          log(`🛑 DETENIDO POR BLOQUEO: No se pudo re-autenticar (${loginErr.message})`);
-          process.exit(2);
-        }
+      // ÚNICO caso de detención: bloqueo real de la página (HTTP 429/403/503)
+      if (err.isBlock) {
+        log(`🛑 DETENIDO POR BLOQUEO: ${err.message}`);
+        process.exit(2);
       }
 
-      // Bloqueo real (HTTP 429, 403, 503, socket hang up agotado)
-      log(`🛑 DETENIDO POR BLOQUEO: ${err.message}`);
-      process.exit(2);
+      // Todo lo demás (sesión expirada, cookie nula, red, login fallido, etc.)
+      // → renovar sesión en bucle sin detener el bot
+      log(`⚠️ Error recuperable: ${err.message}. Re-autenticando...`);
+      let renewed = false;
+      while (!renewed) {
+        await sleep(RETRY_DELAY);
+        try {
+          sessionHeaders = await bot.initialize();
+          log(`✅ Sesión renovada correctamente.`);
+          renewed = true;
+        } catch (loginErr) {
+          if (loginErr.isBlock) {
+            log(`🛑 DETENIDO POR BLOQUEO: Bloqueo al re-autenticar (${loginErr.message})`);
+            process.exit(2);
+          }
+          log(`⚠️ Re-autenticación fallida: ${loginErr.message}. Reintentando en ${RETRY_DELAY} s...`);
+        }
+      }
     }
   }
 }

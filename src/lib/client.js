@@ -190,11 +190,17 @@ export class VisaHttpClient {
 
   _extractRelevantCookies(res) {
     const parsedCookies = this._parseCookies(res.headers.get('set-cookie'));
+    if (!parsedCookies['_yatri_session']) {
+      const err = new Error('Sesión expirada (servidor no devolvió cookie de sesión — posible redirección al login)');
+      err.isSessionExpired = true;
+      throw err;
+    }
     return `_yatri_session=${parsedCookies['_yatri_session']}`;
   }
 
   _parseCookies(cookies) {
     const parsedCookies = {};
+    if (!cookies) return parsedCookies; // guard contra null cuando no hay Set-Cookie
 
     cookies.split(';').map(c => c.trim()).forEach(c => {
       const [name, value] = c.split('=', 2);
