@@ -115,21 +115,35 @@ export class VisaHttpClient {
   }
 
   async _jsonRequest(url, headers = {}) {
-    return fetch(url, {
+    const res = await fetch(url, {
       headers: {
         ...headers,
         "Accept": "application/json",
         "X-Requested-With": "XMLHttpRequest"
       },
       cache: "no-store"
-    })
-      .then(r => {
-        if (r.status === 429 || r.status === 403 || r.status === 503) {
-          throw new Error(`HTTP ${r.status} - Bloqueo o límite de peticiones alcanzado`);
-        }
-        return r.json();
-      })
-      .then(r => this._handleErrors(r));
+    });
+
+    if (res.status === 429 || res.status === 403 || res.status === 503) {
+      const err = new Error(`HTTP ${res.status} - Bloqueo de servidor o límite de peticiones alcanzado`);
+      err.isBlock = true;
+      throw err;
+    }
+
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      if (text.includes('<!DOCTYPE') || text.includes('<html') || text.includes('sign_in')) {
+        const sessionErr = new Error('Sesión expirada (servidor devolvió página de inicio de sesión)');
+        sessionErr.isSessionExpired = true;
+        throw sessionErr;
+      }
+      throw new Error(`Respuesta inesperada del servidor: ${text.slice(0, 100)}`);
+    }
+
+    return this._handleErrors(data);
   }
 
   async _submitForm(url, headers = {}, formData = {}) {

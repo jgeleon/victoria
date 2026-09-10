@@ -18,7 +18,7 @@ dotenv.config();
 // --- Proxy rotativo (Webshare Rotating Residential) -------------------------
 const USER = process.env.PROXY_USER || "dfcbaylc";
 const PASS = process.env.PROXY_PASS || "f22krtiwmj51";
-const PAIS = process.env.PROXY_COUNTRY || "GB"; // PAIS: GB, PE, US...
+const PAIS = process.env.PROXY_COUNTRY || "US"; // PAIS: US, PE, GB...
 const HOST = process.env.PROXY_HOST || "p.webshare.io:80";
 
 export const PROXY_URL = process.env.PROXY_URL || `http://${USER}-${PAIS}-rotate:${PASS}@${HOST}`;

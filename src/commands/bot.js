@@ -26,10 +26,16 @@ export async function botCommand(options) {
     log(`Minimum date: ${minDate}`);
   }
 
+  let sessionHeaders = null;
   try {
-    const sessionHeaders = await bot.initialize();
+    sessionHeaders = await bot.initialize();
+  } catch (err) {
+    log(`🛑 DETENIDO POR BLOQUEO: Error al iniciar sesión (${err.message})`);
+    process.exit(2);
+  }
 
-    while (true) {
+  while (true) {
+    try {
       const availableDate = await bot.checkAvailableDate(
         sessionHeaders,
         currentBookedDate,
@@ -56,9 +62,22 @@ export async function botCommand(options) {
       }
 
       await sleep(config.refreshDelay);
+    } catch (err) {
+      if (err.isSessionExpired || /sesión expirada|session|sign_in/i.test(err.message)) {
+        log(`⚠️ Sesión expirada del portal. Re-autenticando sesión automáticamente...`);
+        try {
+          await sleep(2);
+          sessionHeaders = await bot.initialize();
+          continue;
+        } catch (loginErr) {
+          log(`🛑 DETENIDO POR BLOQUEO: No se pudo re-autenticar (${loginErr.message})`);
+          process.exit(2);
+        }
+      }
+
+      // Bloqueo real (HTTP 429, 403, 503, socket hang up agotado)
+      log(`🛑 DETENIDO POR BLOQUEO: ${err.message}`);
+      process.exit(2);
     }
-  } catch (err) {
-    log(`🛑 DETENIDO POR BLOQUEO: ${err.message}`);
-    process.exit(2);
   }
 }
