@@ -146,6 +146,15 @@ function detectBooking(o, line) {
     else endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.');
   }
 }
+
+function detectBlock(o, line) {
+  if (/DETENIDO POR BLOQUEO|BLOQUEADO|Socket hangup error|IP bloqueada/i.test(line)) {
+    const ctrl = cycles.get(o.id);
+    if (ctrl && !ctrl.userStopped) {
+      ctrl.blocked = true;
+    }
+  }
+}
 function runningOrderIds() { return [...cycles.keys()]; }
 function broadcastState() { broadcast('state', { runningOrderIds: runningOrderIds() }); }
 function pushOrderUpdate(o) { broadcast('orderupdate', { order: publicOrder(o) }); }
@@ -186,7 +195,7 @@ function startOrder(id) {
 
   const durationMs = numOrEmpty(o.durationMin) * 60000;
   const intervalMs = numOrEmpty(o.intervalMin) * 60000;
-  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, durationMs, intervalMs, cycleStart: 0 };
+  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, blocked: false, durationMs, intervalMs, cycleStart: 0 };
   cycles.set(o.id, ctrl);
   saveOrders();
 
@@ -215,21 +224,29 @@ function runCycle(o, ctrl) {
   const handle = (chunk, isErr) => {
     let buf = (isErr ? errBuf : outBuf) + chunk.toString();
     const parts = buf.split(/\r?\n/); buf = parts.pop();
-    for (const l of parts) { appendLog(ctrl.runId, isErr ? `[err] ${l}` : l); if (!isErr) detectBooking(o, l); }
+    for (const l of parts) {
+      appendLog(ctrl.runId, isErr ? `[err] ${l}` : l);
+      detectBlock(o, l);
+      if (!isErr) detectBooking(o, l);
+    }
     if (isErr) errBuf = buf; else outBuf = buf;
   };
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
   cp.on('exit', (code, signal) => {
-    if (outBuf) appendLog(ctrl.runId, outBuf);
-    if (errBuf) appendLog(ctrl.runId, `[err] ${errBuf}`);
+    if (outBuf) { appendLog(ctrl.runId, outBuf); detectBlock(o, outBuf); }
+    if (errBuf) { appendLog(ctrl.runId, `[err] ${errBuf}`); detectBlock(o, errBuf); }
     ctrl.child = null;
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
     ctrl.durationHit = false;
 
     if (ctrl.booked) { endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.'); return; }
     if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
+    if (ctrl.blocked || code === 2) {
+      endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor o proxy.');
+      return;
+    }
     if (code === 0) { endCycle(o, ctrl, 'finished', '✅ Objetivo alcanzado. Ciclo finalizado.'); return; }
 
     // El ciclo terminó (por duración o por sí solo). ¿Reprogramar?

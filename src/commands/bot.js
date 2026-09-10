@@ -58,13 +58,7 @@ export async function botCommand(options) {
       await sleep(config.refreshDelay);
     }
   } catch (err) {
-    if (isSocketHangupError(err)) {
-      log(`Socket hangup error: ${err.message}. Trying again after ${COOLDOWN} seconds...`);
-      await sleep(COOLDOWN);
-    } else {
-      log(`Session/authentication error: ${err.message}. Reintentando en ${RETRY_DELAY} segundos...`);
-      await sleep(RETRY_DELAY);
-    }
-    return botCommand(options);
+    log(`🛑 DETENIDO POR BLOQUEO: ${err.message}`);
+    process.exit(2);
   }
 }

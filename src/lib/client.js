@@ -123,7 +123,12 @@ export class VisaHttpClient {
       },
       cache: "no-store"
     })
-      .then(r => r.json())
+      .then(r => {
+        if (r.status === 429 || r.status === 403 || r.status === 503) {
+          throw new Error(`HTTP ${r.status} - Bloqueo o límite de peticiones alcanzado`);
+        }
+        return r.json();
+      })
       .then(r => this._handleErrors(r));
   }
 
@@ -152,6 +157,9 @@ export class VisaHttpClient {
 
   // Private utility methods
   async _extractHeaders(res) {
+    if (res.status === 429 || res.status === 403 || res.status === 503) {
+      throw new Error(`HTTP ${res.status} al iniciar sesión - Bloqueo detectado`);
+    }
     const cookies = this._extractRelevantCookies(res);
     const html = await res.text();
     const $ = cheerio.load(html);
