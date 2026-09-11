@@ -26,6 +26,7 @@ export const PROXY_URL = process.env.PROXY_URL || `http://${USER}-${PAIS}-rotate
 /**
  * Realiza una petición HTTPS pasando por el proxy rotativo.
  * Crea un agente nuevo por petición para asegurar una IP diferente en cada llamada.
+ * Si USE_PROXY=false, la petición sale por la IP local del servidor (sin proxy).
  *
  * @param {string} url - URL destino
  * @param {object} options - Opciones de fetch
@@ -33,6 +34,19 @@ export const PROXY_URL = process.env.PROXY_URL || `http://${USER}-${PAIS}-rotate
  * @returns {Promise<Response>} - Respuesta estándar de fetch
  */
 export async function fetchRotativo(url, options = {}, maxRetries = 2) {
+  // Si USE_PROXY está explícitamente en 'false', usamos la IP local sin proxy
+  const useProxy = process.env.USE_PROXY !== 'false';
+
+  if (!useProxy) {
+    // Sin proxy: petición directa desde la IP local del servidor
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      throw err;
+    }
+  }
+
+  // Con proxy: rotación de IP por cada petición
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const agent = new HttpsProxyAgent(PROXY_URL, {
       keepAlive: false
