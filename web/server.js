@@ -98,13 +98,17 @@ function numOrEmpty(v) { const n = parseFloat(v); return isFinite(n) && n > 0 ? 
 function publicOrder(o) {
   const ctrl = cycles.get(o.id);
   let runStatus = o.run ? o.run.status : null;
-  if (o.run && ctrl) runStatus = ctrl.phase; // 'running' | 'paused'
+  if (o.run && ctrl) runStatus = ctrl.phase; // 'running' | 'paused' | 'boost' | 'waiting'
   const run = o.run ? { id: o.run.id, status: runStatus, startedAt: o.run.startedAt, endedAt: o.run.endedAt } : null;
-  if (run && ctrl && ctrl.phase === 'paused' && ctrl.reviveAt) run.reviveAt = ctrl.reviveAt;
+  if (run && ctrl) {
+    if (ctrl.phase === 'paused' && ctrl.reviveAt) run.reviveAt = ctrl.reviveAt;
+    if (ctrl.boostEnabled && ctrl.nextBoostAt) run.nextBoostAt = ctrl.nextBoostAt;
+  }
   return {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
+    boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
     hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
@@ -167,17 +171,57 @@ function validateOrder(b, { partial = false } = {}) {
   if (!partial || b.email !== undefined) if (!(b.email || '').trim()) errs.push('Email');
   if (!partial || b.scheduleId !== undefined) if (!(b.scheduleId || '').trim()) errs.push('Schedule ID');
   if (!partial || b.current !== undefined) if (!isDate((b.current || '').trim())) errs.push('Fecha actual (YYYY-MM-DD)');
+  if (b.boostEnabled) {
+    const bm = parseInt(b.boostMinute, 10);
+    if (!(bm >= 0 && bm <= 59)) errs.push('Minuto del boost (0–59)');
+    if (!(parseFloat(b.boostLifeMin) > 0)) errs.push('Tiempo de vida del boost (min)');
+  }
   return errs;
 }
 
 // ---------------- supervisor de ciclos ----------------
-function spawnChild(o) {
+function spawnChild(o, { refreshDelay } = {}) {
   const args = [INDEX_JS, '-c', o.current];
   if ((o.target || '').trim()) args.push('-t', o.target.trim());
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
   if (o.dryRun) args.push('--dry-run');
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
+  const delay = String(refreshDelay || o.refreshDelay || '3');
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
+}
+
+// ms hasta la próxima vez que el reloj del servidor marque el minuto dado (de cualquier hora).
+function msToNextMinute(minute) {
+  const now = new Date();
+  const next = new Date(now.getTime());
+  next.setSeconds(0, 0);
+  next.setMinutes(minute);
+  if (next.getTime() <= now.getTime()) next.setTime(next.getTime() + 3600000);
+  return next.getTime() - now.getTime();
+}
+
+function scheduleBoost(o, ctrl) {
+  if (!ctrl.boostEnabled) return;
+  const wait = msToNextMinute(ctrl.boostMinute);
+  ctrl.nextBoostAt = Date.now() + wait;
+  ctrl.boostTimer = setTimeout(() => onBoostFire(o, ctrl), wait);
+}
+
+function onBoostFire(o, ctrl) {
+  scheduleBoost(o, ctrl); // reprograma el siguiente disparo (cada hora)
+  if (ctrl.userStopped || ctrl.booked) return;
+  appendLog(ctrl.runId, `⚡ Boost: activando (minuto ${ctrl.boostMinute} de cada hora).`);
+  if (ctrl.child) {
+    // hay un run activo -> se interrumpe; el exit handler arranca el boost
+    ctrl.pendingBoost = true;
+    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    ctrl.child.kill('SIGTERM');
+  } else {
+    // sin run activo (en pausa o esperando) -> arrancar boost directo
+    if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+    beginRun(o, ctrl, 'boost');
+  }
+  pushOrderUpdate(o); broadcastState();
 }
 
 function startOrder(id) {
@@ -193,31 +237,53 @@ function startOrder(id) {
   const runId = genId('run');
   o.run = { id: runId, startedAt: Date.now(), endedAt: null, status: 'running' };
 
-  const durationMs = numOrEmpty(o.durationMin) * 60000;
-  const intervalMs = numOrEmpty(o.intervalMin) * 60000;
-  const ctrl = { runId, child: null, phase: 'running', durationTimer: null, pauseTimer: null, userStopped: false, blocked: false, durationMs, intervalMs, cycleStart: 0 };
+  const normalDurationMs = numOrEmpty(o.durationMin) * 60000;
+  const normalIntervalMs = numOrEmpty(o.intervalMin) * 60000;
+  const boostEnabled = !!o.boostEnabled && numOrEmpty(o.boostLifeMin) > 0 && String(o.boostMinute ?? '').trim() !== '';
+  const boostMinute = Math.min(59, Math.max(0, parseInt(o.boostMinute, 10) || 0));
+  const boostLifeMs = numOrEmpty(o.boostLifeMin) * 60000;
+  const boostDelay = String(numOrEmpty(o.boostDelay) || o.refreshDelay || '3');
+
+  const ctrl = {
+    runId, child: null, phase: 'running', mode: 'normal',
+    durationTimer: null, pauseTimer: null, boostTimer: null,
+    userStopped: false, blocked: false, booked: false, durationHit: false,
+    normalDurationMs, normalIntervalMs,
+    boostEnabled, boostMinute, boostLifeMs, boostDelay,
+    cycleStart: 0, reviveAt: 0, nextBoostAt: 0, pendingBoost: false,
+  };
   cycles.set(o.id, ctrl);
   saveOrders();
 
   appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
-  if (durationMs > 0 && intervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
-  else if (durationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
+  if (normalDurationMs > 0 && normalIntervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
+  else if (normalDurationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
+  if (boostEnabled) appendLog(runId, `⚡ Modo boost: al minuto ${boostMinute} de cada hora corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
 
-  runCycle(o, ctrl);
+  if (boostEnabled) scheduleBoost(o, ctrl);
+  beginRun(o, ctrl, 'normal');
   pushOrderUpdate(o); broadcastState();
   return { ok: true, order: publicOrder(o) };
 }
 
-function runCycle(o, ctrl) {
+function beginRun(o, ctrl, mode) {
   if (ctrl.userStopped) return;
-  const { cp, command } = spawnChild(o);
-  ctrl.child = cp; ctrl.phase = 'running'; ctrl.cycleStart = Date.now();
+  ctrl.mode = mode;
+  const isBoost = mode === 'boost';
+  const durationMs = isBoost ? ctrl.boostLifeMs : ctrl.normalDurationMs;
+  const delay = isBoost ? ctrl.boostDelay : (o.refreshDelay || '3');
+  const { cp, command } = spawnChild(o, { refreshDelay: delay });
+  ctrl.child = cp;
+  ctrl.phase = isBoost ? 'boost' : 'running';
+  ctrl.cycleStart = Date.now();
+  ctrl.reviveAt = 0;
   appendLog(ctrl.runId, `$ ${command}`);
-  appendLog(ctrl.runId, `▶ Ciclo iniciado${ctrl.durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
-  pushOrderUpdate(o);
+  if (isBoost) appendLog(ctrl.runId, `⚡ BOOST iniciado (vida ${o.boostLifeMin} min, delay ${delay}s).`);
+  else appendLog(ctrl.runId, `▶ Ciclo iniciado${durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
+  pushOrderUpdate(o); broadcastState();
 
-  if (ctrl.durationMs > 0) {
-    ctrl.durationTimer = setTimeout(() => { if (ctrl.child) { ctrl.durationHit = true; ctrl.child.kill('SIGTERM'); } }, ctrl.durationMs);
+  if (durationMs > 0) {
+    ctrl.durationTimer = setTimeout(() => { if (ctrl.child) { ctrl.durationHit = true; ctrl.child.kill('SIGTERM'); } }, durationMs);
   }
 
   let outBuf = '', errBuf = '';
@@ -234,40 +300,66 @@ function runCycle(o, ctrl) {
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
-  cp.on('exit', (code, signal) => {
+  cp.on('exit', (code) => {
     if (outBuf) { appendLog(ctrl.runId, outBuf); detectBlock(o, outBuf); }
     if (errBuf) { appendLog(ctrl.runId, `[err] ${errBuf}`); detectBlock(o, errBuf); }
     ctrl.child = null;
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    const wasBoost = ctrl.mode === 'boost';
     ctrl.durationHit = false;
 
     if (ctrl.booked) { endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.'); return; }
     if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
+
+    // Un boost programado interrumpió este run -> arrancar el boost ahora
+    if (ctrl.pendingBoost) { ctrl.pendingBoost = false; ctrl.blocked = false; beginRun(o, ctrl, 'boost'); return; }
+
+    if (wasBoost) {
+      // El boost cumplió su tiempo de vida (o cayó) -> retomar el ciclo normal
+      ctrl.blocked = false;
+      appendLog(ctrl.runId, '⚡ Boost finalizado. Retomo el ciclo normal.');
+      beginRun(o, ctrl, 'normal');
+      return;
+    }
+
+    // --- fin de un run NORMAL ---
     if (ctrl.blocked || code === 2) {
-      endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor.');
+      if (ctrl.boostEnabled) { restWaiting(o, ctrl, '🛑 Bloqueo detectado. La orden espera el boost para revivir.'); }
+      else { endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor.'); }
       return;
     }
     if (code === 0) { endCycle(o, ctrl, 'finished', '✅ Objetivo alcanzado. Ciclo finalizado.'); return; }
 
-    // El ciclo terminó (por duración o por sí solo). ¿Reprogramar?
-    if (ctrl.intervalMs > 0) {
-      const wait = Math.max(0, ctrl.intervalMs - (Date.now() - ctrl.cycleStart));
+    if (ctrl.normalIntervalMs > 0) {
+      const wait = Math.max(0, ctrl.normalIntervalMs - (Date.now() - ctrl.cycleStart));
       ctrl.phase = 'paused';
       ctrl.reviveAt = Date.now() + wait;
       appendLog(ctrl.runId, `⏸ Ciclo detenido. Revive en ${Math.round(wait / 1000)} s…`);
       pushOrderUpdate(o); broadcastState();
-      ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; runCycle(o, ctrl); pushOrderUpdate(o); broadcastState(); }, wait);
+      ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; beginRun(o, ctrl, 'normal'); }, wait);
+    } else if (ctrl.boostEnabled) {
+      restWaiting(o, ctrl, '⏸ Ciclo normal cumplido. La orden espera el boost para revivir.');
     } else {
-      // duración sin intervalo: cae y queda detenida
       endCycle(o, ctrl, 'stopped', '⏹ Tiempo de ejecución cumplido. Detenida.');
     }
   });
+}
+
+// La orden queda sin run activo pero armada: el boost la revivirá en su minuto.
+function restWaiting(o, ctrl, msg) {
+  if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+  if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+  ctrl.phase = 'waiting';
+  ctrl.reviveAt = 0;
+  if (msg) appendLog(ctrl.runId, msg);
+  pushOrderUpdate(o); broadcastState();
 }
 
 function endCycle(o, ctrl, status, msg) {
   if (msg) appendLog(ctrl.runId, msg);
   if (ctrl.durationTimer) clearTimeout(ctrl.durationTimer);
   if (ctrl.pauseTimer) clearTimeout(ctrl.pauseTimer);
+  if (ctrl.boostTimer) clearTimeout(ctrl.boostTimer);
   cycles.delete(o.id);
   if (o.run) { o.run.status = status; o.run.endedAt = Date.now(); }
   saveOrders();
@@ -282,8 +374,9 @@ function stopOrder(id) {
   ctrl.userStopped = true;
   if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
   if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+  if (ctrl.boostTimer) { clearTimeout(ctrl.boostTimer); ctrl.boostTimer = null; }
   if (ctrl.child) { ctrl.child.kill('SIGTERM'); }        // el exit handler llama endCycle
-  else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa
+  else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa/espera
   return { ok: true };
 }
 
@@ -315,6 +408,10 @@ function applyFields(o, b, { isNew }) {
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
   if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
+  if (b.boostEnabled !== undefined) o.boostEnabled = !!b.boostEnabled;
+  if (b.boostMinute !== undefined) o.boostMinute = String(b.boostMinute).trim();
+  if (b.boostLifeMin !== undefined) o.boostLifeMin = String(b.boostLifeMin).trim();
+  if (b.boostDelay !== undefined) o.boostDelay = String(b.boostDelay).trim();
   if (isNew) o.password = b.password || '';
   else if (b.password) o.password = b.password;
 }
