@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { VisaHttpClient } from './client.js';
 import { log } from './utils.js';
 
@@ -12,14 +14,59 @@ export class Bot {
       this.config.password,
       { requestTimeoutMs: this.config.requestTimeoutMs }
     );
+    this.sessionFile = options.sessionFile || process.env.SESSION_FILE || null;
+    this._lastSessionSave = 0;
   }
 
   async initialize() {
     log('Initializing visa bot...');
+
+    if (this._tryReuseSession()) {
+      try {
+        await this.client.verifyAccountContext(this.config.scheduleId);
+        log('♻️ Reutilizando sesión guardada (sin volver a iniciar sesión)');
+        this.saveSession(true);
+        return this.client.currentHeaders();
+      } catch (error) {
+        if (error?.code === 'EAUTH') {
+          log('La sesión guardada expiró; iniciando sesión de nuevo');
+        } else {
+          throw error;
+        }
+      }
+    }
+
     const sessionHeaders = await this.client.login();
     await this.client.verifyAccountContext(this.config.scheduleId);
     log('Authenticated schedule verified');
+    this.saveSession(true);
     return sessionHeaders;
+  }
+
+  _tryReuseSession() {
+    if (!this.sessionFile) return false;
+    try {
+      const data = JSON.parse(fs.readFileSync(this.sessionFile, 'utf8'));
+      if (!data || data.email !== this.config.email) return false;
+      if (data.savedAt && (Date.now() - data.savedAt) > 30 * 60 * 1000) return false; // caché válido 30 min
+      return this.client.importSession(data);
+    } catch {
+      return false;
+    }
+  }
+
+  saveSession(force = false) {
+    if (!this.sessionFile) return;
+    const now = Date.now();
+    if (!force && now - this._lastSessionSave < 15000) return; // guarda como mucho cada 15 s
+    this._lastSessionSave = now;
+    try {
+      const data = this.client.exportSession();
+      data.email = this.config.email;
+      data.savedAt = now;
+      fs.mkdirSync(path.dirname(this.sessionFile), { recursive: true });
+      fs.writeFileSync(this.sessionFile, JSON.stringify(data));
+    } catch { /* noop */ }
   }
 
   async checkAvailableDates(sessionHeaders, currentBookedDate, minDate, maxDate) {

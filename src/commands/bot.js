@@ -10,7 +10,7 @@ const JITTER_FACTOR = 0.1;
 export async function botCommand(rawOptions) {
   const options = validateOptions(rawOptions);
   const config = getConfig();
-  const bot = new Bot(config, { dryRun: options.dryRun });
+  const bot = new Bot(config, { dryRun: options.dryRun, sessionFile: process.env.SESSION_FILE });
   const notifier = new Notifier(config);
 
   if (notifier.isEnabled()) log('Telegram notifications enabled');
@@ -45,6 +45,7 @@ export async function botCommand(rawOptions) {
           options.max
         );
         transientFailureCount = 0;
+        bot.saveSession();
 
         const result = await bot.bookFirstAvailable(sessionHeaders, availableDates);
         if (result) {

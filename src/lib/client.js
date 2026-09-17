@@ -37,6 +37,22 @@ export class VisaHttpClient {
     this.csrfToken = null;
   }
 
+  exportSession() {
+    return { cookies: Object.fromEntries(this.cookies), csrfToken: this.csrfToken };
+  }
+
+  importSession(data) {
+    if (!data || typeof data !== 'object') return false;
+    this.cookies.clear();
+    for (const [k, v] of Object.entries(data.cookies || {})) this.cookies.set(k, v);
+    this.csrfToken = data.csrfToken || null;
+    return this.cookies.size > 0;
+  }
+
+  currentHeaders() {
+    return this._sessionHeaders();
+  }
+
   async login() {
     log('Logging in');
     this.cookies.clear();

@@ -186,7 +186,9 @@ function spawnChild(o, { refreshDelay } = {}) {
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
   if (o.dryRun) args.push('--dry-run');
   const delay = String(refreshDelay || o.refreshDelay || '3');
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay };
+  const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
+  try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -487,6 +489,7 @@ const server = http.createServer(async (req, res) => {
     if (!o) return sendJSON(res, 404, { ok: false, error: 'Orden no encontrada' });
     if (orderRunning(o)) return sendResult(res, { ok: false, error: 'Detén la orden antes de borrarla.' });
     if (o.run) { try { fs.unlinkSync(logFile(o.run.id)); } catch { try { fs.writeFileSync(logFile(o.run.id), ''); } catch { /* noop */ } } }
+    try { fs.unlinkSync(path.join(DATA_DIR, 'sessions', `${o.id}.json`)); } catch { /* noop */ }
     orders = orders.filter((x) => x.id !== o.id); saveOrders();
     sendJSON(res, 200, { ok: true });
     return;
