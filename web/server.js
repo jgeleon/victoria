@@ -138,16 +138,25 @@ function broadcast(event, data) {
 }
 function tgEscape(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 async function sendTelegram(text) {
-  if (!telegramEnabled) return;
+  if (!telegramEnabled) return { ok: false, error: 'Telegram no está configurado (define TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID).' };
   try {
     const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true }),
     });
-    if (!r.ok) console.warn('  \u26a0\ufe0f Telegram falló:', r.status);
-  } catch (e) { console.warn('  \u26a0\ufe0f Telegram error:', e.message); }
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      console.warn('  Telegram fallo:', r.status);
+      return { ok: false, error: `HTTP ${r.status} ${body}`.slice(0, 300) };
+    }
+    return { ok: true };
+  } catch (e) {
+    console.warn('  Telegram error:', e.message);
+    return { ok: false, error: e.message };
+  }
 }
+
 function detectBooking(o, line) {
   const m = line.match(/booked time at (\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/);
   if (!m) return;
@@ -515,6 +524,14 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && p === '/api/start') { const b = await readBody(req); sendResult(res, startOrder(b.id)); return; }
   if (req.method === 'POST' && p === '/api/stop') { const b = await readBody(req); sendResult(res, stopOrder(b.id)); return; }
+
+  if (req.method === 'POST' && p === '/api/telegram/test') {
+    const b = await readBody(req);
+    const text = (b && b.text ? String(b.text) : '').trim() || '✅ Mensaje de prueba desde el panel US Visa Bot';
+    const r = await sendTelegram(text);
+    sendResult(res, r);
+    return;
+  }
 
   if (req.method === 'GET' && p === '/api/logs') {
     const runId = url.searchParams.get('runId');

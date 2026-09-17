@@ -157,6 +157,7 @@
     <div class="navitem active" data-view="orders"><span class="ic">📋</span> Órdenes</div>
     <div class="navitem" data-view="bookings"><span class="ic">🎫</span> Citas reservadas <span class="navcount" id="navBookings">0</span></div>
     <button class="side-new" id="btnNew">+ Nueva orden</button>
+    <button class="side-new" id="btnTgTest" style="background:var(--panel2);color:var(--text);border:1px solid var(--border)">🔔 Probar Telegram</button>
     <div class="side-foot"><span id="footCount">0 órdenes</span><br><b id="footRunning">0 en ejecución</b></div>
   </aside>
 
@@ -230,6 +231,17 @@
     <div class="mhead"><div><h3 id="lgTitle">Logs</h3><div class="msub" id="lgSub"></div></div><span class="x" data-close="ovLogs">✕</span></div>
     <div class="conhead"><span id="lgStatus"></span><span class="sp"></span><label class="check" style="font-size:12px;color:var(--muted)"><input type="checkbox" id="autoscroll" checked style="width:15px;height:15px" /> Auto-scroll</label></div>
     <div id="console"></div>
+  </div>
+</div>
+
+<div class="overlay" id="ovTg">
+  <div class="modal">
+    <div class="mhead"><h3>Probar Telegram</h3><span class="x" data-close="ovTg">✕</span></div>
+    <div class="mbody">
+      <div class="field full"><label>Mensaje de prueba</label><input type="text" id="tg_text" value="✅ Prueba desde el panel US Visa Bot" placeholder="Escribe un mensaje…" /></div>
+      <div id="tg_result" style="font-size:12.5px;margin-top:8px;color:var(--muted)"></div>
+    </div>
+    <div class="mfoot"><button class="btn ghost" data-close="ovTg">Cerrar</button><button class="btn primary" id="tg_send">Enviar</button></div>
   </div>
 </div>
 
@@ -510,6 +522,19 @@ function renderBookings(){
 }
 async function delBooking(id){ if(!confirm('¿Quitar esta cita del listado?'))return; await fetch('/api/bookings/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})}); await loadBookings(); }
 $('btnClearBookings').onclick=async()=>{ if(!confirm('¿Borrar TODAS las citas reservadas del listado?'))return; await fetch('/api/bookings/clear',{method:'POST'}); await loadBookings(); };
+
+$('btnTgTest').onclick=()=>{ $('tg_result').textContent=''; openModal('ovTg'); };
+$('tg_send').onclick=async()=>{
+  const btn=$('tg_send'), res=$('tg_result');
+  res.style.color='var(--muted)'; res.textContent='Enviando…'; btn.disabled=true;
+  try{
+    const r=await fetch('/api/telegram/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:$('tg_text').value})});
+    const d=await r.json();
+    if(d.ok){ res.style.color='var(--greenb)'; res.textContent='✅ Enviado. Revisa tu Telegram.'; }
+    else { res.style.color='var(--red)'; res.textContent='❌ '+(d.error||'Error'); }
+  }catch(e){ res.style.color='var(--red)'; res.textContent='❌ '+e.message; }
+  finally{ btn.disabled=false; }
+};
 
 if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').catch(()=>{}); }
 loadState();
