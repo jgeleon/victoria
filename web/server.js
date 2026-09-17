@@ -173,7 +173,7 @@ function validateOrder(b, { partial = false } = {}) {
   if (!partial || b.current !== undefined) if (!isDate((b.current || '').trim())) errs.push('Fecha actual (YYYY-MM-DD)');
   if (b.boostEnabled) {
     const bm = parseInt(b.boostMinute, 10);
-    if (!(bm >= 0 && bm <= 59)) errs.push('Minuto del boost (0–59)');
+    if (!(bm >= 1)) errs.push('Intervalo del boost (min, ≥ 1)');
     if (!(parseFloat(b.boostLifeMin) > 0)) errs.push('Tiempo de vida del boost (min)');
   }
   return errs;
@@ -190,19 +190,24 @@ function spawnChild(o, { refreshDelay } = {}) {
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
-// ms hasta la próxima vez que el reloj del servidor marque el minuto dado (de cualquier hora).
-function msToNextMinute(minute) {
+// ms hasta el próximo disparo: cada 'step' minutos, alineado al reloj del servidor
+// (múltiplos de 'step' contados desde el minuto :00 de cada hora).
+function msToNextInterval(step) {
+  step = Math.max(1, Math.floor(step) || 1);
   const now = new Date();
+  const m = now.getMinutes();
+  const target = (Math.floor(m / step) + 1) * step; // próximo múltiplo > minuto actual
   const next = new Date(now.getTime());
   next.setSeconds(0, 0);
-  next.setMinutes(minute);
-  if (next.getTime() <= now.getTime()) next.setTime(next.getTime() + 3600000);
+  if (target >= 60) { next.setHours(next.getHours() + 1); next.setMinutes(0); }
+  else next.setMinutes(target);
+  if (next.getTime() <= now.getTime()) next.setTime(next.getTime() + 60000);
   return next.getTime() - now.getTime();
 }
 
 function scheduleBoost(o, ctrl) {
   if (!ctrl.boostEnabled) return;
-  const wait = msToNextMinute(ctrl.boostMinute);
+  const wait = msToNextInterval(ctrl.boostMinute);
   ctrl.nextBoostAt = Date.now() + wait;
   ctrl.boostTimer = setTimeout(() => onBoostFire(o, ctrl), wait);
 }
@@ -210,7 +215,7 @@ function scheduleBoost(o, ctrl) {
 function onBoostFire(o, ctrl) {
   scheduleBoost(o, ctrl); // reprograma el siguiente disparo (cada hora)
   if (ctrl.userStopped || ctrl.booked) return;
-  appendLog(ctrl.runId, `⚡ Boost: activando (minuto ${ctrl.boostMinute} de cada hora).`);
+  appendLog(ctrl.runId, `⚡ Boost: activando (cada ${ctrl.boostMinute} min).`);
   if (ctrl.child) {
     // hay un run activo -> se interrumpe; el exit handler arranca el boost
     ctrl.pendingBoost = true;
@@ -239,8 +244,8 @@ function startOrder(id) {
 
   const normalDurationMs = numOrEmpty(o.durationMin) * 60000;
   const normalIntervalMs = numOrEmpty(o.intervalMin) * 60000;
-  const boostEnabled = !!o.boostEnabled && numOrEmpty(o.boostLifeMin) > 0 && String(o.boostMinute ?? '').trim() !== '';
-  const boostMinute = Math.min(59, Math.max(0, parseInt(o.boostMinute, 10) || 0));
+  const boostEnabled = !!o.boostEnabled && numOrEmpty(o.boostLifeMin) > 0 && (parseInt(o.boostMinute, 10) || 0) >= 1;
+  const boostMinute = Math.max(1, parseInt(o.boostMinute, 10) || 1); // intervalo en minutos (cada N)
   const boostLifeMs = numOrEmpty(o.boostLifeMin) * 60000;
   const boostDelay = String(numOrEmpty(o.boostDelay) || o.refreshDelay || '3');
 
@@ -258,7 +263,7 @@ function startOrder(id) {
   appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
   if (normalDurationMs > 0 && normalIntervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
   else if (normalDurationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
-  if (boostEnabled) appendLog(runId, `⚡ Modo boost: al minuto ${boostMinute} de cada hora corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
+  if (boostEnabled) appendLog(runId, `⚡ Modo boost: cada ${boostMinute} min (reloj del servidor) corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
 
   if (boostEnabled) scheduleBoost(o, ctrl);
   beginRun(o, ctrl, 'normal');
