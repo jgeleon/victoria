@@ -5,11 +5,7 @@ export function sleep(seconds) {
 }
 
 export function log(message) {
-  const now = new Date();
-  const pad = (n, z = 2) => String(n).padStart(z, '0');
-  const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
-    `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())},${pad(now.getMilliseconds(), 3)}`;
-  console.log(`[${timestamp}]`, message);
+  console.log(`[${new Date().toISOString()}]`, message);
 }
 
 export function isSocketHangupError(err) {

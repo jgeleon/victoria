@@ -105,7 +105,6 @@ function publicOrder(o) {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
-    useProxy: o.useProxy !== false, // true por defecto
     hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
@@ -177,8 +176,7 @@ function spawnChild(o) {
   if ((o.target || '').trim()) args.push('-t', o.target.trim());
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
   if (o.dryRun) args.push('--dry-run');
-  const useProxy = o.useProxy !== false; // true por defecto
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3'), USE_PROXY: String(useProxy) };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: (o.refreshDelay || '3') };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -202,7 +200,6 @@ function startOrder(id) {
   saveOrders();
 
   appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
-  appendLog(runId, `🌐 Modo red: ${o.useProxy !== false ? '🔀 Proxy rotativo (US)' : '🏠 IP local del servidor'}`);
   if (durationMs > 0 && intervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
   else if (durationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
 
@@ -247,7 +244,7 @@ function runCycle(o, ctrl) {
     if (ctrl.booked) { endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.'); return; }
     if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
     if (ctrl.blocked || code === 2) {
-      endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor o proxy.');
+      endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor.');
       return;
     }
     if (code === 0) { endCycle(o, ctrl, 'finished', '✅ Objetivo alcanzado. Ciclo finalizado.'); return; }
@@ -316,7 +313,6 @@ function applyFields(o, b, { isNew }) {
   if (b.target !== undefined) o.target = String(b.target).trim();
   if (b.min !== undefined) o.min = String(b.min).trim();
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
-  if (b.useProxy !== undefined) o.useProxy = !!b.useProxy;
   if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
   if (isNew) o.password = b.password || '';
