@@ -13,6 +13,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import dotenv from 'dotenv';
+dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -44,6 +46,9 @@ const STATIC_ENV = { LOCALE: 'es-pe', COUNTRY_CODE: 'pe', FACILITY_ID: '115' };
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_KEY || '';
 const useSupabase = !!(SUPABASE_URL && SUPABASE_KEY);
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const telegramEnabled = !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID);
 
 
 // orderId -> controlador de ciclo { runId, child, phase, timers, flags, durationMs, intervalMs }
@@ -131,6 +136,18 @@ function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) { try { res.write(payload); } catch { /* cerrado */ } }
 }
+function tgEscape(v) { return String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+async function sendTelegram(text) {
+  if (!telegramEnabled) return;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML', disable_web_page_preview: true }),
+    });
+    if (!r.ok) console.warn('  \u26a0\ufe0f Telegram falló:', r.status);
+  } catch (e) { console.warn('  \u26a0\ufe0f Telegram error:', e.message); }
+}
 function detectBooking(o, line) {
   const m = line.match(/booked time at (\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})/);
   if (!m) return;
@@ -140,6 +157,7 @@ function detectBooking(o, line) {
   bookings.unshift(bk); saveBookings();
   if (o.run) appendLog(o.run.id, `🎫 CITA RESERVADA: ${date} ${time}`);
   broadcast('booking', { booking: bk });
+  sendTelegram(`🎫 <b>Cita reservada</b>\nCliente: <b>${tgEscape(o.cliente)}</b>\nFecha: <b>${date}</b>  Hora: <b>${time}</b>\nSchedule: ${tgEscape(o.scheduleId)}`);
   // Al reservar, detener la orden: no debe seguir buscando ni revivir.
   const ctrl = cycles.get(o.id);
   if (ctrl) {
@@ -188,7 +206,7 @@ function spawnChild(o, { refreshDelay } = {}) {
   const delay = String(refreshDelay || o.refreshDelay || '3');
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -570,6 +588,7 @@ async function init() {
       console.warn('  \u26a0\ufe0f No se pudo leer de Supabase:', e.message, '- se usan datos locales.');
     }
   }
+  console.log(telegramEnabled ? '  \u2713 Telegram: aviso de reserva activo.' : '  \u25cb Telegram: sin configurar (define TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID).');
   server.listen(PORT, () => { console.log(`\n  US Visa Bot — Dashboard  →  http://localhost:${PORT}\n`); });
 }
 init();
