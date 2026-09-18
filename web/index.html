@@ -214,6 +214,7 @@
         <div class="field"><label>Duración de ejecución (min)</label><input type="number" step="0.1" min="0" id="f_durationMin" placeholder="0 = sin límite" /></div>
         <div class="field"><label>Intervalo del ciclo (min)</label><input type="number" step="0.1" min="0" id="f_intervalMin" placeholder="0 = no repetir" /></div>
         <div class="field full"><label class="check"><input type="checkbox" id="f_dryRun" /><span>Modo simulación (--dry-run)<small>Solo muestra qué reservaría, sin reservar</small></span></label></div>
+        <div class="field full"><label class="check"><input type="checkbox" id="f_useProxy" checked /><span>🔀 Usar proxy en el login (IPs de EE.UU.)<small>El proxy se usa solo al iniciar/renovar sesión; las consultas salen por la IP del servidor. Si se desactiva, el login también sale por la IP del servidor.</small></span></label></div>
         <div class="field full"><label class="check"><input type="checkbox" id="f_boostEnabled" /><span>⚡ Modo boost (refuerzo periódico)<small>Cada N minutos (según el reloj del servidor) reinicia la búsqueda con su propio delay durante su tiempo de vida; si el ciclo normal dejó la orden muerta, la revive.</small></span></label></div>
         <div class="field"><label>Boost: cada cuántos minutos</label><input type="number" min="1" max="60" step="1" id="f_boostMinute" placeholder="Ej. 4" /></div>
         <div class="field"><label>Boost: tiempo de vida (min)</label><input type="number" step="0.1" min="0" id="f_boostLifeMin" placeholder="Ej. 2" /></div>
@@ -312,7 +313,7 @@ function render(){
       '<td class="cliente"><div class="cn">'+esc(o.cliente)+'</div><div class="ce">'+esc(o.email)+'</div></td>'+
       '<td><span class="range">'+esc(fmtRange(o))+'</span></td>'+
       '<td><span class="pill-sch">ID: '+esc(o.scheduleId)+'</span></td>'+
-      '<td><span class="badge '+st+'">'+EST_LABEL[st]+'</span>'+(o.dryRun?' <span class="badge finished" title="simulación">sim</span>':'')+cycleInfo+boostInfo+'</td>'+
+      '<td><span class="badge '+st+'">'+EST_LABEL[st]+'</span>'+(o.dryRun?' <span class="badge finished" title="simulación">sim</span>':'')+(o.useProxy!==false?' <span class="badge" style="background:var(--panel2);border:1px solid var(--border);color:var(--muted)" title="login vía proxy">🔀</span>':'')+cycleInfo+boostInfo+'</td>'+
       '<td class="cita">'+cita+'</td>'+
       '<td><div class="acts">'+
         '<span class="ab view" data-viewlogs="'+o.id+'" data-run="'+runId+'" title="Ver logs">👁</span>'+
@@ -366,6 +367,7 @@ function fillForm(o){
   $('f_durationMin').value=o?(o.durationMin||''):'';
   $('f_intervalMin').value=o?(o.intervalMin||''):'';
   $('f_dryRun').checked=o?!!o.dryRun:false;
+  $('f_useProxy').checked=o?(o.useProxy!==false):true;
   $('f_boostEnabled').checked=o?!!o.boostEnabled:false;
   $('f_boostMinute').value=o?(o.boostMinute||''):'';
   $('f_boostLifeMin').value=o?(o.boostLifeMin||''):'';
@@ -384,7 +386,7 @@ $('omSave').onclick=async()=>{
   const body={
     id, cliente:$('f_cliente').value, email:$('f_email').value, password:$('f_password').value,
     scheduleId:$('f_scheduleId').value, refreshDelay:$('f_refreshDelay').value,
-    current:$('f_current').value, target:$('f_target').value, min:$('f_min').value, dryRun:$('f_dryRun').checked,
+    current:$('f_current').value, target:$('f_target').value, min:$('f_min').value, dryRun:$('f_dryRun').checked, useProxy:$('f_useProxy').checked,
     durationMin:$('f_durationMin').value, intervalMin:$('f_intervalMin').value,
     boostEnabled:$('f_boostEnabled').checked, boostMinute:$('f_boostMinute').value, boostLifeMin:$('f_boostLifeMin').value, boostDelay:$('f_boostDelay').value,
   };

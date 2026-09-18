@@ -114,6 +114,7 @@ function publicOrder(o) {
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
     boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
+    useProxy: o.useProxy !== false,
     hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
@@ -215,7 +216,7 @@ function spawnChild(o, { refreshDelay } = {}) {
   const delay = String(refreshDelay || o.refreshDelay || '3');
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -440,6 +441,7 @@ function applyFields(o, b, { isNew }) {
   if (b.target !== undefined) o.target = String(b.target).trim();
   if (b.min !== undefined) o.min = String(b.min).trim();
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
+  if (b.useProxy !== undefined) o.useProxy = !!b.useProxy;
   if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
   if (b.boostEnabled !== undefined) o.boostEnabled = !!b.boostEnabled;

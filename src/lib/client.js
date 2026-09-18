@@ -1,10 +1,31 @@
 import fetch from 'node-fetch';
 import https from 'https';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import cheerio from 'cheerio';
 import { log } from './utils.js';
 import { getBaseUri } from './config.js';
 
-const agent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+
+// Proxy SOLO para el login/re-login (cuando la sesión murió y hay que re-autenticar).
+// Activo por defecto; se apaga con USE_PROXY=false. Las peticiones normales
+// (fechas/horarios/reserva) siempre salen por la IP directa del servidor.
+function loginProxyEnabled() {
+  const v = String(process.env.USE_PROXY ?? '').trim().toLowerCase();
+  return !(v === 'false' || v === '0' || v === 'no' || v === 'off');
+}
+function proxyUrl() {
+  if (process.env.PROXY_URL) return process.env.PROXY_URL;
+  const user = process.env.PROXY_USER || 'dfcbaylc';
+  const pass = process.env.PROXY_PASS || 'f22krtiwmj51';
+  const country = process.env.PROXY_COUNTRY || 'US';
+  const host = process.env.PROXY_HOST || 'p.webshare.io:80';
+  return `http://${user}-${country}-rotate:${pass}@${host}`;
+}
+function makeProxyAgent() {
+  try { return new HttpsProxyAgent(proxyUrl(), { keepAlive: false }); }
+  catch { return null; }
+}
 const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const TRANSIENT_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
@@ -55,11 +76,13 @@ export class VisaHttpClient {
 
   async login() {
     log('Logging in');
+    log(loginProxyEnabled() ? '🔀 Login vía proxy rotativo (US)' : '🏠 Login por IP directa');
     this.cookies.clear();
 
     const signInUrl = `${this.baseUri}/users/sign_in`;
     const signInResponse = await this._request(signInUrl, {
-      headers: { Accept: 'text/html,application/xhtml+xml' }
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      useProxy: true
     });
     const signInHtml = await signInResponse.text();
     const csrfToken = this._extractCsrfToken(signInHtml, signInResponse.url);
@@ -82,14 +105,16 @@ export class VisaHttpClient {
         'X-CSRF-Token': csrfToken,
         'X-Requested-With': 'XMLHttpRequest'
       },
-      body: new URLSearchParams(loginData)
+      body: new URLSearchParams(loginData),
+      useProxy: true
     });
     let loginHtml = await loginResponse.text();
     const javascriptRedirect = this._javascriptRedirect(loginHtml);
 
     if (javascriptRedirect) {
       loginResponse = await this._request(new URL(javascriptRedirect, signInUrl), {
-        headers: { Accept: 'text/html,application/xhtml+xml' }
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+        useProxy: true
       });
       loginHtml = await loginResponse.text();
     }
@@ -255,25 +280,36 @@ export class VisaHttpClient {
   async _request(initialUrl, options = {}) {
     let url = String(initialUrl);
     let requestOptions = { ...options, headers: { ...options.headers } };
+    let usingProxy = !!options.useProxy && loginProxyEnabled();
+    let proxyFellBack = false;
+    delete requestOptions.useProxy;
 
     for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      const requestAgent = usingProxy ? (makeProxyAgent() || keepAliveAgent) : keepAliveAgent;
       let response;
 
       try {
         response = await this.fetch(url, {
           ...requestOptions,
-          agent,
+          agent: requestAgent,
           redirect: 'manual',
           signal: controller.signal,
           headers: {
             ...COMMON_HEADERS,
+            ...(usingProxy ? { Connection: 'close' } : {}),
             ...requestOptions.headers,
             ...(this.cookies.size ? { Cookie: this._cookieHeader() } : {})
           }
         });
       } catch (error) {
+        if (usingProxy && !proxyFellBack && error?.name !== 'AbortError' && error?.type !== 'aborted') {
+          proxyFellBack = true;
+          usingProxy = false;
+          log(`Proxy de login falló (${error.message}); reintentando el login por IP directa`);
+          continue;
+        }
         if (error?.name === 'AbortError' || error?.type === 'aborted') {
           throw new VisaClientError(`Request timed out after ${this.requestTimeoutMs}ms`, 'ETRANSIENT', { cause: error });
         }
