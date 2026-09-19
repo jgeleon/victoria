@@ -32,7 +32,7 @@ test('checkAvailableDates keeps every qualifying 2026 date', async () => {
 
   const dates = await bot.checkAvailableDates({}, '2027-04-30', '2026-01-01', '2026-12-31');
 
-  assert.deepEqual(dates, ['2026-01-01', '2026-12-31']);
+  assert.deepEqual(dates.map(d => d.date), ['2026-01-01', '2026-12-31']);
 });
 
 test('later dates are attempted when the earliest date has no times', async () => {
@@ -49,7 +49,7 @@ test('later dates are attempted when the earliest date has no times', async () =
   const result = await bot.bookFirstAvailable({}, ['2026-03-01', '2026-04-01']);
 
   assert.deepEqual(checkedDates, ['2026-03-01', '2026-04-01']);
-  assert.deepEqual(result, { booked: true, time: '09:00', date: '2026-04-01' });
+  assert.deepEqual(result, { booked: true, time: '09:00', date: '2026-04-01', facilityId: '456' });
 });
 
 test('authentication booking failures are not swallowed as slot races', async () => {

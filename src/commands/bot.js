@@ -5,7 +5,8 @@ import { log, sleep } from '../lib/utils.js';
 
 const SESSION_BACKOFF_SECONDS = [15, 30, 60, 90];
 const TRANSIENT_BACKOFF_SECONDS = [5, 10, 20, 30];
-const JITTER_FACTOR = 0.1;
+const BLOCK_COOLDOWN_SECONDS = [30, 120, 300, 600];
+const JITTER_FACTOR = 0.2;
 
 export async function botCommand(rawOptions) {
   const options = validateOptions(rawOptions);
@@ -18,6 +19,10 @@ export async function botCommand(rawOptions) {
   await notifier.notifyStarted(options.current, options.target, options.max, options.min, options.dryRun);
 
   let sessionFailureCount = 0;
+  let blockFailureCount = 0;
+  let pollCount = 0;
+  let candidatesSeen = 0;
+  let metricsAt = Date.now();
 
   while (true) {
     let sessionHeaders;
@@ -45,12 +50,19 @@ export async function botCommand(rawOptions) {
           options.max
         );
         transientFailureCount = 0;
+        blockFailureCount = 0;
+        pollCount += 1;
+        candidatesSeen += availableDates.length;
+        if (Date.now() - metricsAt >= 60000) {
+          log(`📊 Métricas: ${pollCount} sondeos en ${Math.round((Date.now() - metricsAt) / 1000)}s · fechas candidatas acumuladas=${candidatesSeen}`);
+          metricsAt = Date.now(); pollCount = 0; candidatesSeen = 0;
+        }
         bot.saveSession();
 
         const result = await bot.bookFirstAvailable(sessionHeaders, availableDates);
         if (result) {
           await notifier.notifyBooked(result.date, result.time, options.dryRun);
-          log(`Successfully ${options.dryRun ? 'found' : 'booked'} appointment on ${result.date} at ${result.time}`);
+          log(`Successfully ${options.dryRun ? 'found' : 'booked'} appointment on ${result.date} at ${result.time}${result.facilityId ? ` (facility ${result.facilityId})` : ''}`);
           return;
         }
 
@@ -72,6 +84,15 @@ export async function botCommand(rawOptions) {
           await notifier.notifyError(error.message, delay);
           await sleep(delay);
           continue;
+        }
+
+        if (error.code === 'EBLOCK') {
+          blockFailureCount += 1;
+          const delay = BLOCK_COOLDOWN_SECONDS[Math.min(blockFailureCount - 1, BLOCK_COOLDOWN_SECONDS.length - 1)];
+          log(`WAF/anti-bot challenge detectado. Enfriando ${delay}s y renovando sesión (bloqueo #${blockFailureCount})`);
+          await notifier.notifyError('WAF/anti-bot challenge', delay);
+          await sleep(delay);
+          break;
         }
 
         if (error.code === 'ETRANSIENT') {

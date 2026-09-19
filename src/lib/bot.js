@@ -70,115 +70,137 @@ export class Bot {
   }
 
   async checkAvailableDates(sessionHeaders, currentBookedDate, minDate, maxDate) {
-    const dates = await this.client.checkAvailableDate(
-      sessionHeaders,
-      this.config.scheduleId,
-      this.config.facilityId
-    );
-
-    if (!dates || dates.length === 0) {
-      log("no dates available");
-      return [];
-    }
+    const facilityIds = (this.config.facilityIds && this.config.facilityIds.length)
+      ? this.config.facilityIds
+      : [this.config.facilityId];
 
     const minKey = minDate ? dateKey(minDate) : null;
     const maxKey = maxDate ? dateKey(maxDate) : null;
     const currentKey = currentBookedDate ? dateKey(currentBookedDate) : null;
-    const rejected = { invalid: 0, beforeMin: 0, afterMax: 0, notEarlier: 0 };
-    const goodDates = [];
 
-    for (const date of new Set(dates)) {
-      let key;
+    const candidates = [];
+    for (const facilityId of facilityIds) {
+      let dates;
       try {
-        key = dateKey(date);
-      } catch {
-        rejected.invalid += 1;
+        dates = await this.client.checkAvailableDate(
+          sessionHeaders,
+          this.config.scheduleId,
+          facilityId,
+          { onlyBusinessDay: this.config.onlyBusinessDay }
+        );
+      } catch (err) {
+        // Un consulado puede fallar sin tumbar al resto; los bloqueos/sesión sí se propagan.
+        if (['EAUTH', 'ERATELIMIT', 'EBLOCK'].includes(err?.code)) throw err;
+        log(`facility ${facilityId}: error consultando fechas (${err.message})`);
         continue;
       }
-      if (minKey !== null && key < minKey) {
-        rejected.beforeMin += 1;
-        continue;
+
+      if (!dates || dates.length === 0) { log(`facility ${facilityId}: sin fechas`); continue; }
+
+      const rejected = { invalid: 0, beforeMin: 0, afterMax: 0, notEarlier: 0 };
+      let good = 0;
+      for (const date of new Set(dates)) {
+        let key;
+        try { key = dateKey(date); } catch { rejected.invalid += 1; continue; }
+        if (minKey !== null && key < minKey) { rejected.beforeMin += 1; continue; }
+        if (maxKey !== null && key > maxKey) { rejected.afterMax += 1; continue; }
+        if (currentKey !== null && key >= currentKey) { rejected.notEarlier += 1; continue; }
+        candidates.push({ date, facilityId, key });
+        good += 1;
       }
-      if (maxKey !== null && key > maxKey) {
-        rejected.afterMax += 1;
-        continue;
-      }
-      if (currentKey !== null && key >= currentKey) {
-        rejected.notEarlier += 1;
-        continue;
-      }
-      goodDates.push(date);
+      log(`facility ${facilityId}: ${good} fechas válidas de ${dates.length} (rechazadas=${JSON.stringify(rejected)})`);
     }
 
-    if (goodDates.length === 0) {
-      log(`No qualifying dates from ${dates.length} returned; rejected=${JSON.stringify(rejected)}`);
+    if (candidates.length === 0) {
+      log('No qualifying dates across facilities');
       return [];
     }
 
-    goodDates.sort();
-    log(`Found ${goodDates.length} qualifying dates from ${dates.length} returned: ${goodDates.join(', ')}`);
-    return goodDates;
+    candidates.sort((a, b) => a.key - b.key);
+    const seen = new Set();
+    const result = [];
+    for (const c of candidates) {
+      const k = `${c.facilityId}:${c.date}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      result.push({ date: c.date, facilityId: c.facilityId });
+    }
+    log(`Total ${result.length} fechas candidatas; más temprana: ${result[0].date} (facility ${result[0].facilityId})`);
+    return result;
   }
 
-  async bookAppointment(sessionHeaders, date) {
-    if (this.bookedDates.has(date)) {
-      log(`date ${date} was already booked this session, skipping`);
+  async bookAppointment(sessionHeaders, date, facilityId = this.config.facilityId) {
+    const bookedKey = `${facilityId}:${date}`;
+    if (this.bookedDates.has(bookedKey)) {
+      log(`date ${date} @${facilityId} was already booked this session, skipping`);
       return null;
     }
 
-    const times = await this.client.checkAvailableTimes(
+    let times = await this.client.checkAvailableTimes(
       sessionHeaders,
       this.config.scheduleId,
-      this.config.facilityId,
+      facilityId,
       date
     );
 
     if (!times || times.length === 0) {
-      log(`no available time slots for date ${date}`);
+      log(`no available time slots for date ${date} @${facilityId}`);
       return null;
     }
 
     if (this.dryRun) {
       const time = times[0];
-      log(`[DRY RUN] Would book appointment at ${date} ${time} (not actually booking)`);
-      this.bookedDates.add(date);
+      log(`[DRY RUN] Would book appointment at ${date} ${time} @${facilityId} (not actually booking)`);
+      this.bookedDates.add(bookedKey);
       return { booked: true, time };
     }
 
-    for (const time of times) {
-      try {
-        await this.client.book(
-          sessionHeaders,
-          this.config.scheduleId,
-          this.config.facilityId,
-          date,
-          time
-        );
+    let retriedTimes = false;
+    while (true) {
+      for (const time of times) {
+        try {
+          await this.client.book(
+            sessionHeaders,
+            this.config.scheduleId,
+            facilityId,
+            date,
+            time,
+            { ascFacilityId: this.config.ascFacilityId }
+          );
 
-        this.bookedDates.add(date);
-        log(`booked time at ${date} ${time}`);
-        return { booked: true, time };
-      } catch (err) {
-        log(`failed to book ${date} ${time}: ${err.message}`);
-        if (err.code !== 'ESLOT_UNAVAILABLE') {
-          throw err;
+          this.bookedDates.add(bookedKey);
+          log(`booked time at ${date} ${time}`);
+          return { booked: true, time };
+        } catch (err) {
+          log(`failed to book ${date} ${time}: ${err.message}`);
+          if (err.code !== 'ESLOT_UNAVAILABLE') throw err;
         }
       }
+
+      // Todos los horarios se los llevó otro (carrera de cupo): reintenta una vez re-pidiendo horarios.
+      if (!retriedTimes) {
+        retriedTimes = true;
+        log(`slot race on all times for ${date} @${facilityId}; refetching times once`);
+        times = await this.client.checkAvailableTimes(sessionHeaders, this.config.scheduleId, facilityId, date);
+        if (times && times.length) continue;
+      }
+      break;
     }
 
-    log(`all available time slots failed for date ${date}`);
+    log(`all available time slots failed for date ${date} @${facilityId}`);
     return null;
   }
 
-  async bookFirstAvailable(sessionHeaders, dates) {
-    for (const date of dates) {
-      const result = await this.bookAppointment(sessionHeaders, date);
-      if (result) return { ...result, date };
-      log(`No usable times remained for ${date}; checking the next candidate`);
+  async bookFirstAvailable(sessionHeaders, candidates) {
+    for (const c of candidates) {
+      const date = typeof c === 'string' ? c : c.date;
+      const facilityId = typeof c === 'string' ? this.config.facilityId : c.facilityId;
+      const result = await this.bookAppointment(sessionHeaders, date, facilityId);
+      if (result) return { ...result, date, facilityId };
+      log(`No usable times remained for ${date} @${facilityId}; checking the next candidate`);
     }
     return null;
   }
-
 }
 
 export function dateKey(value) {

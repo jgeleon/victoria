@@ -4,6 +4,7 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import cheerio from 'cheerio';
 import { log } from './utils.js';
 import { getBaseUri } from './config.js';
+import { rateLimit } from './limiter.js';
 
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
 
@@ -26,7 +27,14 @@ function makeProxyAgent() {
   try { return new HttpsProxyAgent(proxyUrl(), { keepAlive: false }); }
   catch { return null; }
 }
-const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const USER_AGENTS = [
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+];
+const USER_AGENT = USER_AGENTS[0];
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const TRANSIENT_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
@@ -56,6 +64,7 @@ export class VisaHttpClient {
     this.fetch = options.fetch || fetch;
     this.cookies = new Map();
     this.csrfToken = null;
+    this.userAgent = options.userAgent || USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   }
 
   exportSession() {
@@ -141,7 +150,7 @@ export class VisaHttpClient {
     return html;
   }
 
-  async checkAvailableDate(_headers, scheduleId, facilityId) {
+  async checkAvailableDate(_headers, scheduleId, facilityId, { onlyBusinessDay = false } = {}) {
     const url = new URL(`${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment/days/${encodeURIComponent(facilityId)}.json`);
     url.searchParams.set('appointments[expedite]', 'false');
 
@@ -150,14 +159,13 @@ export class VisaHttpClient {
     if (!Array.isArray(data)) {
       throw new VisaClientError('Unexpected appointment-days response: expected an array', 'ESCHEMA');
     }
-
-    const dates = data.map(item => item?.date);
-    if (dates.some(date => typeof date !== 'string')) {
+    if (data.some(item => typeof item?.date !== 'string')) {
       throw new VisaClientError('Unexpected appointment-days response: invalid date entry', 'ESCHEMA');
     }
 
     log(`##DATES##${JSON.stringify(data)}`);
-    return dates;
+    const items = onlyBusinessDay ? data.filter(item => item.business_day !== false) : data;
+    return items.map(item => item.date);
   }
 
   async checkAvailableTimes(_headers, scheduleId, facilityId, date) {
@@ -185,39 +193,32 @@ export class VisaHttpClient {
     return uniqueTimes;
   }
 
-  async book(_headers, scheduleId, facilityId, date, time) {
+  async book(_headers, scheduleId, facilityId, date, time, options = {}) {
     const url = this._appointmentUrl(scheduleId);
+
+    // ASC (biometría) opt-in: solo si se configuró un facility de ASC
+    let asc = null;
+    if (options.ascFacilityId) {
+      asc = await this._resolveAsc(scheduleId, options.ascFacilityId, facilityId, date, time);
+    }
+
+    // Intento rápido: reutiliza el CSRF cacheado y evita el GET previo a la reserva
+    if (this.csrfToken) {
+      const fast = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time, asc));
+      const outcome = this._classifyBooking(fast.response.url, fast.body, date, time);
+      if (outcome === 'ok') return fast.response;
+      if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
+      // 'auth' / 'retry' -> reintenta con token fresco
+    }
+
+    // Camino con token fresco (GET a la página de cita -> POST -> verificación)
     const appointmentResponse = await this._request(url, {
       headers: { Accept: 'text/html,application/xhtml+xml' }
     });
     const appointmentHtml = await appointmentResponse.text();
-    const csrfToken = this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
+    this.csrfToken = this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
 
-    const bookingData = {
-      utf8: '✓',
-      authenticity_token: csrfToken,
-      confirmed_limit_message: '1',
-      use_consulate_appointment_capacity: 'true',
-      'appointments[consulate_appointment][facility_id]': facilityId,
-      'appointments[consulate_appointment][date]': date,
-      'appointments[consulate_appointment][time]': time,
-      'appointments[asc_appointment][facility_id]': '',
-      'appointments[asc_appointment][date]': '',
-      'appointments[asc_appointment][time]': ''
-    };
-
-    const response = await this._request(url, {
-      method: 'POST',
-      headers: {
-        Accept: 'text/html,application/xhtml+xml',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        Origin: new URL(this.baseUri).origin,
-        Referer: url,
-        'X-CSRF-Token': csrfToken
-      },
-      body: new URLSearchParams(bookingData)
-    });
-    const body = await response.text();
+    const { response, body } = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time, asc));
 
     if (this._isSignInPage(response.url, body)) {
       throw new VisaClientError('Session expired while booking', 'EAUTH');
@@ -240,6 +241,87 @@ export class VisaHttpClient {
     return response;
   }
 
+  _buildBookingData(csrfToken, facilityId, date, time, asc) {
+    return {
+      utf8: '✓',
+      authenticity_token: csrfToken,
+      confirmed_limit_message: '1',
+      use_consulate_appointment_capacity: 'true',
+      'appointments[consulate_appointment][facility_id]': facilityId,
+      'appointments[consulate_appointment][date]': date,
+      'appointments[consulate_appointment][time]': time,
+      'appointments[asc_appointment][facility_id]': asc?.facilityId || '',
+      'appointments[asc_appointment][date]': asc?.date || '',
+      'appointments[asc_appointment][time]': asc?.time || ''
+    };
+  }
+
+  async _postBooking(url, csrfToken, bookingData) {
+    const response = await this._request(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'text/html,application/xhtml+xml',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        Origin: new URL(this.baseUri).origin,
+        Referer: url,
+        'X-CSRF-Token': csrfToken
+      },
+      body: new URLSearchParams(bookingData)
+    });
+    const body = await response.text();
+    return { response, body };
+  }
+
+  // Clasifica la respuesta de reserva sin lanzar: 'ok' | 'slot' | 'auth' | 'retry'
+  _classifyBooking(url, body, date, time) {
+    if (this._isSignInPage(url, body)) return 'auth';
+    const normalized = cheerio.load(body)('body').text().toLowerCase();
+    const failures = ['not available', 'no longer available', 'please try again', 'unable to', 'invalid appointment'];
+    if (failures.some(m => normalized.includes(m))) return 'slot';
+    const positive = normalized.includes('successfully') ||
+      normalized.includes('appointment confirmation') ||
+      (normalized.includes(date.toLowerCase()) && normalized.includes(time.toLowerCase()));
+    return positive ? 'ok' : 'retry';
+  }
+
+  // ASC (Application Support Center) — best-effort, patrón estándar de usvisa-info.
+  // Si algo falla, devuelve null y se reserva sin ASC (comportamiento por defecto).
+  async _resolveAsc(scheduleId, ascFacilityId, consulateFacilityId, date, time) {
+    try {
+      const daysUrl = new URL(`${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment/days/${encodeURIComponent(ascFacilityId)}.json`);
+      daysUrl.searchParams.set('consulate_id', consulateFacilityId);
+      daysUrl.searchParams.set('consulate_date', date);
+      daysUrl.searchParams.set('consulate_time', time);
+      daysUrl.searchParams.set('appointments[expedite]', 'false');
+      const days = await this._jsonRequest(daysUrl, scheduleId);
+      const ascDate = Array.isArray(days) && days.length ? days[0]?.date : null;
+      if (!ascDate) { log('ASC: sin días disponibles; se reserva sin ASC'); return null; }
+
+      const timesUrl = new URL(`${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment/times/${encodeURIComponent(ascFacilityId)}.json`);
+      timesUrl.searchParams.set('date', ascDate);
+      timesUrl.searchParams.set('consulate_id', consulateFacilityId);
+      timesUrl.searchParams.set('consulate_date', date);
+      timesUrl.searchParams.set('consulate_time', time);
+      timesUrl.searchParams.set('appointments[expedite]', 'false');
+      const t = await this._jsonRequest(timesUrl, scheduleId);
+      const ascTime = (t?.available_times?.length ? t.available_times : (t?.business_times || []))[0];
+      if (!ascTime) { log('ASC: sin horarios disponibles; se reserva sin ASC'); return null; }
+
+      log(`ASC seleccionado: ${ascDate} ${ascTime} (facility ${ascFacilityId})`);
+      return { facilityId: ascFacilityId, date: ascDate, time: ascTime };
+    } catch (e) {
+      log(`ASC: no se pudo resolver (${e.message}); se reserva sin ASC`);
+      return null;
+    }
+  }
+
+  _looksLikeChallenge(html = '') {
+    const t = String(html).toLowerCase();
+    return t.includes('cloudflare') || t.includes('cf-chl') || t.includes('just a moment') ||
+      t.includes('attention required') || t.includes('captcha') || t.includes('access denied') ||
+      t.includes('/cdn-cgi/') || t.includes('are you a human') || t.includes('unusual traffic');
+  }
+
   async _jsonRequest(url, scheduleId) {
     const startedAt = Date.now();
     const response = await this._request(url, {
@@ -259,6 +341,9 @@ export class VisaHttpClient {
       throw new VisaClientError('Session expired: received the sign-in page for appointment data', 'EAUTH');
     }
     if (!contentType.includes('json')) {
+      if (this._looksLikeChallenge(text)) {
+        throw new VisaClientError('Visa site returned a WAF/anti-bot challenge instead of JSON', 'EBLOCK');
+      }
       throw new VisaClientError(`Expected JSON appointment data but received ${contentType || 'unknown content type'}`, 'ESCHEMA');
     }
 
@@ -285,6 +370,7 @@ export class VisaHttpClient {
     delete requestOptions.useProxy;
 
     for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+      await rateLimit();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
       const requestAgent = usingProxy ? (makeProxyAgent() || keepAliveAgent) : keepAliveAgent;
@@ -298,6 +384,7 @@ export class VisaHttpClient {
           signal: controller.signal,
           headers: {
             ...COMMON_HEADERS,
+            'User-Agent': this.userAgent,
             ...(usingProxy ? { Connection: 'close' } : {}),
             ...requestOptions.headers,
             ...(this.cookies.size ? { Cookie: this._cookieHeader() } : {})
