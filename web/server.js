@@ -115,7 +115,7 @@ function publicOrder(o) {
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
     boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
     useProxy: o.useProxy !== false,
-    facilityIds: o.facilityIds || '', ascFacilityId: o.ascFacilityId || '', onlyBusinessDay: !!o.onlyBusinessDay,
+    facilityIds: o.facilityIds || '', onlyBusinessDay: !!o.onlyBusinessDay,
     hasPassword: !!o.password, running: orderRunning(o), run,
   };
 }
@@ -217,7 +217,7 @@ function spawnChild(o, { refreshDelay } = {}) {
   const delay = String(refreshDelay || o.refreshDelay || '3');
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ASC_FACILITY_ID: (o.ascFacilityId || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -444,7 +444,6 @@ function applyFields(o, b, { isNew }) {
   if (b.dryRun !== undefined) o.dryRun = !!b.dryRun;
   if (b.useProxy !== undefined) o.useProxy = !!b.useProxy;
   if (b.facilityIds !== undefined) o.facilityIds = String(b.facilityIds).trim();
-  if (b.ascFacilityId !== undefined) o.ascFacilityId = String(b.ascFacilityId).trim();
   if (b.onlyBusinessDay !== undefined) o.onlyBusinessDay = !!b.onlyBusinessDay;
   if (b.durationMin !== undefined) o.durationMin = String(b.durationMin).trim();
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();

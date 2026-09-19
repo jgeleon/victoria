@@ -193,18 +193,12 @@ export class VisaHttpClient {
     return uniqueTimes;
   }
 
-  async book(_headers, scheduleId, facilityId, date, time, options = {}) {
+  async book(_headers, scheduleId, facilityId, date, time) {
     const url = this._appointmentUrl(scheduleId);
-
-    // ASC (biometría) opt-in: solo si se configuró un facility de ASC
-    let asc = null;
-    if (options.ascFacilityId) {
-      asc = await this._resolveAsc(scheduleId, options.ascFacilityId, facilityId, date, time);
-    }
 
     // Intento rápido: reutiliza el CSRF cacheado y evita el GET previo a la reserva
     if (this.csrfToken) {
-      const fast = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time, asc));
+      const fast = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time));
       const outcome = this._classifyBooking(fast.response.url, fast.body, date, time);
       if (outcome === 'ok') return fast.response;
       if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
@@ -218,7 +212,7 @@ export class VisaHttpClient {
     const appointmentHtml = await appointmentResponse.text();
     this.csrfToken = this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
 
-    const { response, body } = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time, asc));
+    const { response, body } = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time));
 
     if (this._isSignInPage(response.url, body)) {
       throw new VisaClientError('Session expired while booking', 'EAUTH');
@@ -241,7 +235,7 @@ export class VisaHttpClient {
     return response;
   }
 
-  _buildBookingData(csrfToken, facilityId, date, time, asc) {
+  _buildBookingData(csrfToken, facilityId, date, time) {
     return {
       utf8: '✓',
       authenticity_token: csrfToken,
@@ -250,9 +244,9 @@ export class VisaHttpClient {
       'appointments[consulate_appointment][facility_id]': facilityId,
       'appointments[consulate_appointment][date]': date,
       'appointments[consulate_appointment][time]': time,
-      'appointments[asc_appointment][facility_id]': asc?.facilityId || '',
-      'appointments[asc_appointment][date]': asc?.date || '',
-      'appointments[asc_appointment][time]': asc?.time || ''
+      'appointments[asc_appointment][facility_id]': '',
+      'appointments[asc_appointment][date]': '',
+      'appointments[asc_appointment][time]': ''
     };
   }
 
@@ -282,37 +276,6 @@ export class VisaHttpClient {
       normalized.includes('appointment confirmation') ||
       (normalized.includes(date.toLowerCase()) && normalized.includes(time.toLowerCase()));
     return positive ? 'ok' : 'retry';
-  }
-
-  // ASC (Application Support Center) — best-effort, patrón estándar de usvisa-info.
-  // Si algo falla, devuelve null y se reserva sin ASC (comportamiento por defecto).
-  async _resolveAsc(scheduleId, ascFacilityId, consulateFacilityId, date, time) {
-    try {
-      const daysUrl = new URL(`${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment/days/${encodeURIComponent(ascFacilityId)}.json`);
-      daysUrl.searchParams.set('consulate_id', consulateFacilityId);
-      daysUrl.searchParams.set('consulate_date', date);
-      daysUrl.searchParams.set('consulate_time', time);
-      daysUrl.searchParams.set('appointments[expedite]', 'false');
-      const days = await this._jsonRequest(daysUrl, scheduleId);
-      const ascDate = Array.isArray(days) && days.length ? days[0]?.date : null;
-      if (!ascDate) { log('ASC: sin días disponibles; se reserva sin ASC'); return null; }
-
-      const timesUrl = new URL(`${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment/times/${encodeURIComponent(ascFacilityId)}.json`);
-      timesUrl.searchParams.set('date', ascDate);
-      timesUrl.searchParams.set('consulate_id', consulateFacilityId);
-      timesUrl.searchParams.set('consulate_date', date);
-      timesUrl.searchParams.set('consulate_time', time);
-      timesUrl.searchParams.set('appointments[expedite]', 'false');
-      const t = await this._jsonRequest(timesUrl, scheduleId);
-      const ascTime = (t?.available_times?.length ? t.available_times : (t?.business_times || []))[0];
-      if (!ascTime) { log('ASC: sin horarios disponibles; se reserva sin ASC'); return null; }
-
-      log(`ASC seleccionado: ${ascDate} ${ascTime} (facility ${ascFacilityId})`);
-      return { facilityId: ascFacilityId, date: ascDate, time: ascTime };
-    } catch (e) {
-      log(`ASC: no se pudo resolver (${e.message}); se reserva sin ASC`);
-      return null;
-    }
   }
 
   _looksLikeChallenge(html = '') {

@@ -11,7 +11,6 @@ export function getConfig() {
     scheduleId: process.env.SCHEDULE_ID?.trim(),
     facilityIds,
     facilityId: facilityIds[0],
-    ascFacilityId: process.env.ASC_FACILITY_ID?.trim() || null,
     onlyBusinessDay: /^(1|true|yes|on)$/i.test(String(process.env.ONLY_BUSINESS_DAY || '').trim()),
     countryCode: process.env.COUNTRY_CODE?.trim().toLowerCase(),
     refreshDelay: Number(process.env.REFRESH_DELAY || 20),
@@ -42,9 +41,6 @@ export function validateConfig(config) {
   }
   if (!/^\d+$/.test(config.scheduleId) || !facilityIds.every(f => /^\d+$/.test(f))) {
     throw configError('SCHEDULE_ID and FACILITY_ID(S) must contain only digits');
-  }
-  if (config.ascFacilityId && !/^\d+$/.test(config.ascFacilityId)) {
-    throw configError('ASC_FACILITY_ID must contain only digits');
   }
   if (!Number.isFinite(config.refreshDelay) || config.refreshDelay <= 0) {
     throw configError('REFRESH_DELAY must be a positive number');

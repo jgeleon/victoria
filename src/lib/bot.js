@@ -164,8 +164,7 @@ export class Bot {
             this.config.scheduleId,
             facilityId,
             date,
-            time,
-            { ascFacilityId: this.config.ascFacilityId }
+            time
           );
 
           this.bookedDates.add(bookedKey);
