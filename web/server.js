@@ -113,7 +113,7 @@ function publicOrder(o) {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
-    boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
+    boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostAt: o.boostAt || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
     useProxy: o.useProxy !== false,
     facilityIds: o.facilityIds || '', onlyBusinessDay: !!o.onlyBusinessDay,
     hasPassword: !!o.password, running: orderRunning(o), run,
@@ -202,7 +202,9 @@ function validateOrder(b, { partial = false } = {}) {
   if (!partial || b.current !== undefined) if (!isDate((b.current || '').trim())) errs.push('Fecha actual (YYYY-MM-DD)');
   if (b.boostEnabled) {
     const bm = parseInt(b.boostMinute, 10);
-    if (!(bm >= 1)) errs.push('Intervalo del boost (min, ≥ 1)');
+    const at = String(b.boostAt || '').trim();
+    if (at) { if (!parseBoostAt(at)) errs.push('Momentos del boost (mm:ss, ej. 5:03, 35:03)'); }
+    else if (!(bm >= 1)) errs.push('Intervalo del boost (min, ≥ 1) o momentos exactos (mm:ss)');
     if (!(parseFloat(b.boostLifeMin) > 0)) errs.push('Tiempo de vida del boost (min)');
   }
   return errs;
@@ -236,9 +238,40 @@ function msToNextInterval(step) {
   return next.getTime() - now.getTime();
 }
 
+// "5:03, 35:03" -> [303, 2103] (segundos dentro de la hora, ordenados). null si es inválido.
+function parseBoostAt(str) {
+  const parts = String(str || '').split(/[,;\s]+/).filter(Boolean);
+  if (!parts.length) return null;
+  const slots = new Set();
+  for (const p of parts) {
+    const m = /^(\d{1,2})(?::(\d{1,2}))?$/.exec(p);
+    if (!m) return null;
+    const mm = parseInt(m[1], 10), ss = parseInt(m[2] || '0', 10);
+    if (mm > 59 || ss > 59) return null;
+    slots.add(mm * 60 + ss);
+  }
+  return [...slots].sort((a, b) => a - b);
+}
+
+function fmtSlot(sec) { return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`; }
+
+// ms hasta el próximo momento exacto (minuto:segundo) de cada hora, según el reloj del servidor.
+// Margen de 1 s para que un setTimeout que dispara unos ms antes no repita el mismo momento.
+function msToNextSlot(slots) {
+  const now = Date.now();
+  const hourStart = new Date(now); hourStart.setMinutes(0, 0, 0);
+  for (let h = 0; h < 2; h++) {
+    for (const sec of slots) {
+      const t = hourStart.getTime() + h * 3600000 + sec * 1000;
+      if (t > now + 1000) return t - now;
+    }
+  }
+  return 3600000;
+}
+
 function scheduleBoost(o, ctrl) {
   if (!ctrl.boostEnabled) return;
-  const wait = msToNextInterval(ctrl.boostMinute);
+  const wait = ctrl.boostSlots ? msToNextSlot(ctrl.boostSlots) : msToNextInterval(ctrl.boostMinute);
   ctrl.nextBoostAt = Date.now() + wait;
   ctrl.boostTimer = setTimeout(() => onBoostFire(o, ctrl), wait);
 }
@@ -246,7 +279,7 @@ function scheduleBoost(o, ctrl) {
 function onBoostFire(o, ctrl) {
   scheduleBoost(o, ctrl); // reprograma el siguiente disparo (cada hora)
   if (ctrl.userStopped || ctrl.booked) return;
-  appendLog(ctrl.runId, `⚡ Boost: activando (cada ${ctrl.boostMinute} min).`);
+  appendLog(ctrl.runId, `⚡ Boost: activando (${ctrl.boostLabel}).`);
   if (ctrl.child) {
     // hay un run activo -> se interrumpe; el exit handler arranca el boost
     ctrl.pendingBoost = true;
@@ -275,8 +308,10 @@ function startOrder(id) {
 
   const normalDurationMs = numOrEmpty(o.durationMin) * 60000;
   const normalIntervalMs = numOrEmpty(o.intervalMin) * 60000;
-  const boostEnabled = !!o.boostEnabled && numOrEmpty(o.boostLifeMin) > 0 && (parseInt(o.boostMinute, 10) || 0) >= 1;
+  const boostSlots = (o.boostAt || '').trim() ? parseBoostAt(o.boostAt) : null; // momentos exactos mm:ss (tienen prioridad)
+  const boostEnabled = !!o.boostEnabled && numOrEmpty(o.boostLifeMin) > 0 && (!!boostSlots || (parseInt(o.boostMinute, 10) || 0) >= 1);
   const boostMinute = Math.max(1, parseInt(o.boostMinute, 10) || 1); // intervalo en minutos (cada N)
+  const boostLabel = boostSlots ? `en ${boostSlots.map(fmtSlot).join(', ')} de cada hora` : `cada ${boostMinute} min`;
   const boostLifeMs = numOrEmpty(o.boostLifeMin) * 60000;
   const boostDelay = String(numOrEmpty(o.boostDelay) || o.refreshDelay || '3');
 
@@ -285,7 +320,7 @@ function startOrder(id) {
     durationTimer: null, pauseTimer: null, boostTimer: null,
     userStopped: false, blocked: false, booked: false, durationHit: false,
     normalDurationMs, normalIntervalMs,
-    boostEnabled, boostMinute, boostLifeMs, boostDelay,
+    boostEnabled, boostMinute, boostSlots, boostLabel, boostLifeMs, boostDelay,
     cycleStart: 0, reviveAt: 0, nextBoostAt: 0, pendingBoost: false,
   };
   cycles.set(o.id, ctrl);
@@ -294,7 +329,7 @@ function startOrder(id) {
   appendLog(runId, `Fijos: LOCALE=${STATIC_ENV.LOCALE}  COUNTRY_CODE=${STATIC_ENV.COUNTRY_CODE}  FACILITY_ID=${STATIC_ENV.FACILITY_ID}`);
   if (normalDurationMs > 0 && normalIntervalMs > 0) appendLog(runId, `♻️ Ciclo activo: corre ${o.durationMin} min, revive cada ${o.intervalMin} min.`);
   else if (normalDurationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
-  if (boostEnabled) appendLog(runId, `⚡ Modo boost: cada ${boostMinute} min (reloj del servidor) corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
+  if (boostEnabled) appendLog(runId, `⚡ Modo boost: ${boostLabel} (reloj del servidor) corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
 
   if (boostEnabled) scheduleBoost(o, ctrl);
   beginRun(o, ctrl, 'normal');
@@ -449,6 +484,7 @@ function applyFields(o, b, { isNew }) {
   if (b.intervalMin !== undefined) o.intervalMin = String(b.intervalMin).trim();
   if (b.boostEnabled !== undefined) o.boostEnabled = !!b.boostEnabled;
   if (b.boostMinute !== undefined) o.boostMinute = String(b.boostMinute).trim();
+  if (b.boostAt !== undefined) o.boostAt = String(b.boostAt).trim();
   if (b.boostLifeMin !== undefined) o.boostLifeMin = String(b.boostLifeMin).trim();
   if (b.boostDelay !== undefined) o.boostDelay = String(b.boostDelay).trim();
   if (isNew) o.password = b.password || '';
