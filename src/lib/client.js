@@ -409,6 +409,7 @@ export class VisaHttpClient {
 
   _storeCookies(response) {
     const rawCookies = response.headers.raw?.()['set-cookie'] || [];
+    let changed = false;
     for (const header of rawCookies) {
       const normalizedHeader = String(header);
       const cookiePart = normalizedHeader.split(';', 1)[0];
@@ -416,8 +417,13 @@ export class VisaHttpClient {
       if (separator <= 0) continue;
       const name = cookiePart.slice(0, separator).trim();
       const value = cookiePart.slice(separator + 1).trim();
-      if (value && !/;\s*max-age=0(?:;|$)/i.test(normalizedHeader)) this.cookies.set(name, value);
-      else this.cookies.delete(name);
+      if (value && !/;\s*max-age=0(?:;|$)/i.test(normalizedHeader)) {
+        if (this.cookies.get(name) !== value) { this.cookies.set(name, value); changed = true; }
+      } else if (this.cookies.delete(name)) changed = true;
+    }
+    // El sitio rota la cookie de sesión en cada respuesta: avisar para persistirla al instante
+    if (changed && this.onCookiesChanged) {
+      try { this.onCookiesChanged(); } catch { /* noop */ }
     }
   }
 

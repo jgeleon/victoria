@@ -14,6 +14,9 @@ export async function botCommand(rawOptions) {
   const bot = new Bot(config, { dryRun: options.dryRun, sessionFile: process.env.SESSION_FILE });
   const notifier = new Notifier(config);
 
+  // El supervisor corta los ciclos/boost con SIGTERM: persistir la última cookie antes de salir
+  process.once('SIGTERM', () => { bot.saveSession(true); process.exit(143); });
+
   if (notifier.isEnabled()) log('Telegram notifications enabled');
   logSearchOptions(options);
   await notifier.notifyStarted(options.current, options.target, options.max, options.min, options.dryRun);

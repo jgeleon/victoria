@@ -16,31 +16,32 @@ export class Bot {
     );
     this.sessionFile = options.sessionFile || process.env.SESSION_FILE || null;
     this._lastSessionSave = 0;
+    this._authenticated = false; // solo se persisten cookies de una sesión ya autenticada
+    this._reuseTried = false;    // la sesión en disco se intenta solo en el primer initialize del proceso
+    this.client.onCookiesChanged = () => { if (this._authenticated) this.saveSession(true); };
   }
 
   async initialize() {
     log('Initializing visa bot...');
+    this._authenticated = false;
 
-    if (this._tryReuseSession()) {
-      try {
-        await this.client.verifyAccountContext(this.config.scheduleId);
-        log('♻️ Reutilizando sesión guardada (sin volver a iniciar sesión)');
-        this.saveSession(true);
+    // Sin verificación previa: la primera consulta de fechas valida la sesión. Si falla con
+    // EAUTH, el bucle vuelve a initialize() y como _reuseTried ya es true, hace login.
+    if (!this._reuseTried) {
+      this._reuseTried = true;
+      if (this._tryReuseSession()) {
+        this._authenticated = true;
+        log('♻️ Reutilizando sesión guardada (se valida en la primera consulta)');
         return this.client.currentHeaders();
-      } catch (error) {
-        if (error?.code === 'EAUTH') {
-          log('La sesión guardada expiró; iniciando sesión de nuevo');
-        } else {
-          throw error;
-        }
       }
     }
 
-    const sessionHeaders = await this.client.login();
+    await this.client.login();
     await this.client.verifyAccountContext(this.config.scheduleId);
     log('Authenticated schedule verified');
+    this._authenticated = true;
     this.saveSession(true);
-    return sessionHeaders;
+    return this.client.currentHeaders();
   }
 
   _tryReuseSession() {
@@ -56,7 +57,7 @@ export class Bot {
   }
 
   saveSession(force = false) {
-    if (!this.sessionFile) return;
+    if (!this.sessionFile || !this._authenticated) return;
     const now = Date.now();
     if (!force && now - this._lastSessionSave < 15000) return; // guarda como mucho cada 15 s
     this._lastSessionSave = now;
