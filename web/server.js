@@ -108,12 +108,13 @@ function publicOrder(o) {
   if (run && ctrl) {
     if (ctrl.phase === 'paused' && ctrl.reviveAt) run.reviveAt = ctrl.reviveAt;
     if (ctrl.boostEnabled && ctrl.nextBoostAt) run.nextBoostAt = ctrl.nextBoostAt;
+    if (ctrl.weeklyEnabled && ctrl.nextWeeklyAt) run.nextWeeklyAt = ctrl.nextWeeklyAt;
   }
   return {
     id: o.id, cliente: o.cliente, email: o.email, scheduleId: o.scheduleId,
     refreshDelay: o.refreshDelay, current: o.current, target: o.target, min: o.min, dryRun: o.dryRun,
     durationMin: o.durationMin || '', intervalMin: o.intervalMin || '',
-    boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostAt: o.boostAt || '', boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
+    boostEnabled: !!o.boostEnabled, boostMinute: o.boostMinute || '', boostAt: o.boostAt || '', boostFocus: !!o.boostFocus, weeklyBoost: !!o.weeklyBoost, boostLifeMin: o.boostLifeMin || '', boostDelay: o.boostDelay || '',
     useProxy: o.useProxy !== false,
     facilityIds: o.facilityIds || '', onlyBusinessDay: !!o.onlyBusinessDay,
     hasPassword: !!o.password, running: orderRunning(o), run,
@@ -211,7 +212,7 @@ function validateOrder(b, { partial = false } = {}) {
 }
 
 // ---------------- supervisor de ciclos ----------------
-function spawnChild(o, { refreshDelay } = {}) {
+function spawnChild(o, { refreshDelay, focusWindow } = {}) {
   const args = [INDEX_JS, '-c', o.current];
   if ((o.target || '').trim()) args.push('-t', o.target.trim());
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
@@ -219,7 +220,7 @@ function spawnChild(o, { refreshDelay } = {}) {
   const delay = String(refreshDelay || o.refreshDelay || '3');
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), LOGIN_LOCK_DIR: path.join(DATA_DIR, 'locks'), DATE_FAILURES_FILE: path.join(DATA_DIR, 'datefail', `${o.id}.json`), FOCUS_WINDOW: focusWindow || '', GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
   return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
 }
 
@@ -269,6 +270,48 @@ function msToNextSlot(slots) {
   return 3600000;
 }
 
+// Liberación semanal de Perú: miércoles 12:00 hora de Lima. Ventana rápida de 11:58 a 12:08.
+const WEEKLY_DAY = 3;                 // miércoles
+const WEEKLY_START_UTC_MIN = 16 * 60 + 58; // 11:58 Lima = 16:58 UTC (Lima no tiene horario de verano)
+const WEEKLY_LIFE_MS = 10 * 60000;
+function msToNextWeekly(now = Date.now()) {
+  const d = new Date(now);
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, WEEKLY_START_UTC_MIN));
+  let days = (WEEKLY_DAY - t.getUTCDay() + 7) % 7;
+  t.setUTCDate(t.getUTCDate() + days);
+  if (t.getTime() <= now + 1000) t.setUTCDate(t.getUTCDate() + 7);
+  return t.getTime() - now;
+}
+
+function scheduleWeekly(o, ctrl) {
+  if (!ctrl.weeklyEnabled) return;
+  const wait = msToNextWeekly();
+  ctrl.nextWeeklyAt = Date.now() + wait;
+  ctrl.weeklyTimer = setTimeout(() => onWeeklyFire(o, ctrl), wait);
+}
+
+function onWeeklyFire(o, ctrl) {
+  scheduleWeekly(o, ctrl);
+  if (ctrl.userStopped || ctrl.booked) return;
+  ctrl.weeklyUntil = Date.now() + WEEKLY_LIFE_MS;
+  appendLog(ctrl.runId, '📅 Boost semanal: liberación del miércoles 12:00 (Lima). Corre 10 min.');
+  startBoostNow(o, ctrl, WEEKLY_LIFE_MS);
+}
+
+// Arranca un boost ya: si hay run activo lo corta y el exit handler lo lanza.
+function startBoostNow(o, ctrl, lifeMs) {
+  ctrl.pendingLifeMs = lifeMs || 0;
+  if (ctrl.child) {
+    ctrl.pendingBoost = true;
+    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    ctrl.child.kill('SIGTERM');
+  } else {
+    if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+    beginRun(o, ctrl, 'boost', { lifeMs: ctrl.pendingLifeMs });
+  }
+  pushOrderUpdate(o); broadcastState();
+}
+
 function scheduleBoost(o, ctrl) {
   if (!ctrl.boostEnabled) return;
   const wait = ctrl.boostSlots ? msToNextSlot(ctrl.boostSlots) : msToNextInterval(ctrl.boostMinute);
@@ -277,20 +320,11 @@ function scheduleBoost(o, ctrl) {
 }
 
 function onBoostFire(o, ctrl) {
-  scheduleBoost(o, ctrl); // reprograma el siguiente disparo (cada hora)
+  scheduleBoost(o, ctrl); // reprograma el siguiente disparo
   if (ctrl.userStopped || ctrl.booked) return;
+  if (Date.now() < ctrl.weeklyUntil) return; // el boost semanal está corriendo: no cortarlo
   appendLog(ctrl.runId, `⚡ Boost: activando (${ctrl.boostLabel}).`);
-  if (ctrl.child) {
-    // hay un run activo -> se interrumpe; el exit handler arranca el boost
-    ctrl.pendingBoost = true;
-    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
-    ctrl.child.kill('SIGTERM');
-  } else {
-    // sin run activo (en pausa o esperando) -> arrancar boost directo
-    if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
-    beginRun(o, ctrl, 'boost');
-  }
-  pushOrderUpdate(o); broadcastState();
+  startBoostNow(o, ctrl, 0);
 }
 
 function startOrder(id) {
@@ -321,6 +355,7 @@ function startOrder(id) {
     userStopped: false, blocked: false, booked: false, durationHit: false,
     normalDurationMs, normalIntervalMs,
     boostEnabled, boostMinute, boostSlots, boostLabel, boostLifeMs, boostDelay,
+    weeklyEnabled: !!o.weeklyBoost, weeklyTimer: null, nextWeeklyAt: 0, weeklyUntil: 0, pendingLifeMs: 0,
     cycleStart: 0, reviveAt: 0, nextBoostAt: 0, pendingBoost: false,
   };
   cycles.set(o.id, ctrl);
@@ -331,25 +366,28 @@ function startOrder(id) {
   else if (normalDurationMs > 0) appendLog(runId, `⏱️ Ejecución limitada a ${o.durationMin} min (sin repetición).`);
   if (boostEnabled) appendLog(runId, `⚡ Modo boost: ${boostLabel} (reloj del servidor) corre ${o.boostLifeMin} min con delay ${boostDelay}s (revive si está muerta).`);
 
+  if (o.weeklyBoost) appendLog(runId, '📅 Boost semanal activo: miércoles 11:58–12:08 (Lima).');
   if (boostEnabled) scheduleBoost(o, ctrl);
+  scheduleWeekly(o, ctrl);
   beginRun(o, ctrl, 'normal');
   pushOrderUpdate(o); broadcastState();
   return { ok: true, order: publicOrder(o) };
 }
 
-function beginRun(o, ctrl, mode) {
+function beginRun(o, ctrl, mode, { lifeMs } = {}) {
   if (ctrl.userStopped) return;
   ctrl.mode = mode;
   const isBoost = mode === 'boost';
-  const durationMs = isBoost ? ctrl.boostLifeMs : ctrl.normalDurationMs;
+  const durationMs = isBoost ? (lifeMs || ctrl.boostLifeMs) : ctrl.normalDurationMs;
   const delay = isBoost ? ctrl.boostDelay : (o.refreshDelay || '3');
-  const { cp, command } = spawnChild(o, { refreshDelay: delay });
+  const focusWindow = isBoost && o.boostFocus ? FOCUS_WINDOW_PE : '';
+  const { cp, command } = spawnChild(o, { refreshDelay: delay, focusWindow });
   ctrl.child = cp;
   ctrl.phase = isBoost ? 'boost' : 'running';
   ctrl.cycleStart = Date.now();
   ctrl.reviveAt = 0;
   appendLog(ctrl.runId, `$ ${command}`);
-  if (isBoost) appendLog(ctrl.runId, `⚡ BOOST iniciado (vida ${o.boostLifeMin} min, delay ${delay}s).`);
+  if (isBoost) appendLog(ctrl.runId, `⚡ BOOST iniciado (vida ${Math.round(durationMs / 6000) / 10} min, delay ${delay}s${focusWindow ? `, ventana s${focusWindow}` : ''}).`);
   else appendLog(ctrl.runId, `▶ Ciclo iniciado${durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
   pushOrderUpdate(o); broadcastState();
 
@@ -382,8 +420,11 @@ function beginRun(o, ctrl, mode) {
     if (ctrl.booked) { endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.'); return; }
     if (ctrl.userStopped) { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); return; }
 
+    // Errores que reintentar no arregla: no revivir la orden
+    if (FATAL_EXITS[code]) { endCycle(o, ctrl, FATAL_EXITS[code].status, FATAL_EXITS[code].msg); return; }
+
     // Un boost programado interrumpió este run -> arrancar el boost ahora
-    if (ctrl.pendingBoost) { ctrl.pendingBoost = false; ctrl.blocked = false; beginRun(o, ctrl, 'boost'); return; }
+    if (ctrl.pendingBoost) { ctrl.pendingBoost = false; ctrl.blocked = false; beginRun(o, ctrl, 'boost', { lifeMs: ctrl.pendingLifeMs }); return; }
 
     if (wasBoost) {
       // El boost cumplió su tiempo de vida (o cayó) -> retomar el ciclo normal
@@ -395,7 +436,7 @@ function beginRun(o, ctrl, mode) {
 
     // --- fin de un run NORMAL ---
     if (ctrl.blocked || code === 2) {
-      if (ctrl.boostEnabled) { restWaiting(o, ctrl, '🛑 Bloqueo detectado. La orden espera el boost para revivir.'); }
+      if (ctrl.boostEnabled || ctrl.weeklyEnabled) { restWaiting(o, ctrl, '🛑 Bloqueo detectado. La orden espera el boost para revivir.'); }
       else { endCycle(o, ctrl, 'blocked', '🛑 Detenido por bloqueo del servidor.'); }
       return;
     }
@@ -408,13 +449,23 @@ function beginRun(o, ctrl, mode) {
       appendLog(ctrl.runId, `⏸ Ciclo detenido. Revive en ${Math.round(wait / 1000)} s…`);
       pushOrderUpdate(o); broadcastState();
       ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; beginRun(o, ctrl, 'normal'); }, wait);
-    } else if (ctrl.boostEnabled) {
+    } else if (ctrl.boostEnabled || ctrl.weeklyEnabled) {
       restWaiting(o, ctrl, '⏸ Ciclo normal cumplido. La orden espera el boost para revivir.');
     } else {
       endCycle(o, ctrl, 'stopped', '⏹ Tiempo de ejecución cumplido. Detenida.');
     }
   });
 }
+
+// Códigos de salida del bot (src/index.js) que detienen la orden sin revivirla
+const FATAL_EXITS = {
+  3: { status: 'auth_error', msg: '🔐 Email o contraseña incorrectos, o cuenta bloqueada por el portal. Revisa la orden antes de reintentar.' },
+  4: { status: 'no_reschedules', msg: '🚫 El portal indica 0 reprogramaciones restantes. Orden detenida.' },
+  5: { status: 'verify', msg: '⚠️ No se pudo confirmar si la reserva se hizo. Revisa la cita en el portal antes de reiniciar.' },
+};
+
+// Ventana de liberación de Perú (segundos del minuto) medida en visa-scraper
+const FOCUS_WINDOW_PE = '13-26';
 
 // La orden queda sin run activo pero armada: el boost la revivirá en su minuto.
 function restWaiting(o, ctrl, msg) {
@@ -431,6 +482,7 @@ function endCycle(o, ctrl, status, msg) {
   if (ctrl.durationTimer) clearTimeout(ctrl.durationTimer);
   if (ctrl.pauseTimer) clearTimeout(ctrl.pauseTimer);
   if (ctrl.boostTimer) clearTimeout(ctrl.boostTimer);
+  if (ctrl.weeklyTimer) clearTimeout(ctrl.weeklyTimer);
   cycles.delete(o.id);
   if (o.run) { o.run.status = status; o.run.endedAt = Date.now(); }
   saveOrders();
@@ -446,6 +498,7 @@ function stopOrder(id) {
   if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
   if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
   if (ctrl.boostTimer) { clearTimeout(ctrl.boostTimer); ctrl.boostTimer = null; }
+  if (ctrl.weeklyTimer) { clearTimeout(ctrl.weeklyTimer); ctrl.weeklyTimer = null; }
   if (ctrl.child) { ctrl.child.kill('SIGTERM'); }        // el exit handler llama endCycle
   else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa/espera
   return { ok: true };
@@ -485,6 +538,8 @@ function applyFields(o, b, { isNew }) {
   if (b.boostEnabled !== undefined) o.boostEnabled = !!b.boostEnabled;
   if (b.boostMinute !== undefined) o.boostMinute = String(b.boostMinute).trim();
   if (b.boostAt !== undefined) o.boostAt = String(b.boostAt).trim();
+  if (b.boostFocus !== undefined) o.boostFocus = !!b.boostFocus;
+  if (b.weeklyBoost !== undefined) o.weeklyBoost = !!b.weeklyBoost;
   if (b.boostLifeMin !== undefined) o.boostLifeMin = String(b.boostLifeMin).trim();
   if (b.boostDelay !== undefined) o.boostDelay = String(b.boostDelay).trim();
   if (isNew) o.password = b.password || '';

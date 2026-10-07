@@ -8,18 +8,66 @@ const TRANSIENT_BACKOFF_SECONDS = [5, 10, 20, 30];
 const BLOCK_COOLDOWN_SECONDS = [30, 120, 300, 600];
 const JITTER_FACTOR = 0.2;
 
+// Con errores seguidos se espacian los intentos: insistir contra un bloqueo lo alarga.
+// Se vuelve al ritmo normal con el primer sondeo exitoso.
+export function errorSpacingSeconds(streak) {
+  if (streak < 5) return 0;
+  if (streak < 15) return 60;
+  if (streak < 30) return 120;
+  if (streak < 50) return 300;
+  return 600;
+}
+
+// Ventana de liberación (ej. "13-26": segundos 13 a 25 de cada minuto). Fuera de ella se
+// espera al próximo inicio en vez de consultar.
+export function parseFocusWindow(value) {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(String(value || '').trim());
+  if (!m) return null;
+  const start = Number(m[1]), end = Number(m[2]);
+  return start < end && end <= 60 ? { start, end } : null;
+}
+
+export function focusDelaySeconds(baseSeconds, win, nowMs = Date.now()) {
+  if (!win) return baseSeconds;
+  const at = nowMs + baseSeconds * 1000;
+  const sec = Math.floor((at % 60000) / 1000);
+  if (sec >= win.start && sec < win.end) return baseSeconds;
+  const inMinute = at % 60000;
+  let wait = win.start * 1000 - inMinute;
+  if (wait <= 0) wait += 60000;
+  return (at - nowMs + wait) / 1000;
+}
+
 export async function botCommand(rawOptions) {
   const options = validateOptions(rawOptions);
   const config = getConfig();
   const bot = new Bot(config, { dryRun: options.dryRun, sessionFile: process.env.SESSION_FILE });
   const notifier = new Notifier(config);
+  const focusWindow = parseFocusWindow(process.env.FOCUS_WINDOW);
 
-  // El supervisor corta los ciclos/boost con SIGTERM: persistir la última cookie antes de salir
-  process.once('SIGTERM', () => { bot.saveSession(true); process.exit(143); });
+  // El supervisor corta los ciclos/boost con SIGTERM: esperar la petición en vuelo y
+  // persistir la última cookie antes de salir
+  process.once('SIGTERM', async () => {
+    log('🔒 Cerrando: guardando la sesión antes de salir');
+    await bot.shutdown();
+    process.exit(143);
+  });
 
   if (notifier.isEnabled()) log('Telegram notifications enabled');
   logSearchOptions(options);
   await notifier.notifyStarted(options.current, options.target, options.max, options.min, options.dryRun);
+
+  if (focusWindow) log(`🎯 Consultas concentradas en los segundos ${focusWindow.start}-${focusWindow.end - 1} de cada minuto`);
+
+  let errorStreak = 0;
+  const pause = async (delay, reason) => {
+    const spacing = errorSpacingSeconds(errorStreak);
+    if (spacing > delay) {
+      log(`🐢 ${errorStreak} errores seguidos: espero ${spacing}s antes de reintentar (${reason})`);
+      delay = spacing;
+    }
+    await sleep(delay);
+  };
 
   let sessionFailureCount = 0;
   let blockFailureCount = 0;
@@ -35,10 +83,11 @@ export async function botCommand(rawOptions) {
     } catch (error) {
       if (isPermanentError(error)) throw error;
       sessionFailureCount += 1;
+      errorStreak += 1;
       const delay = backoffSeconds(SESSION_BACKOFF_SECONDS, sessionFailureCount);
       log(`Login/session initialization failed: ${error.message}. Retrying in ${delay}s`);
       await notifier.notifyError(error.message, delay);
-      await sleep(delay);
+      await pause(delay, 'login');
       continue;
     }
 
@@ -54,6 +103,8 @@ export async function botCommand(rawOptions) {
         );
         transientFailureCount = 0;
         blockFailureCount = 0;
+        errorStreak = 0;
+        bot.reusedSession = false;
         pollCount += 1;
         candidatesSeen += availableDates.length;
         if (Date.now() - metricsAt >= 60000) {
@@ -74,18 +125,24 @@ export async function botCommand(rawOptions) {
           return;
         }
 
-        await sleep(jitterSeconds(config.refreshDelay));
+        await sleep(focusDelaySeconds(jitterSeconds(config.refreshDelay), focusWindow));
       } catch (error) {
         if (error.code === 'EAUTH') {
+          if (bot.reusedSession) {
+            log(`🔍 El portal rechazó la sesión reutilizada: ${bot.describeRejectedSession(error)}`);
+            bot.reusedSession = false;
+          }
           log(`Session expired: ${error.message}. Logging in again`);
           break;
         }
+        if (isPermanentError(error)) throw error;
+        errorStreak += 1;
 
         if (error.code === 'ERATELIMIT') {
           const delay = Math.max(30, Number(error.retryAfterSeconds) || 60);
           log(`Visa site rate limit reached. Waiting ${delay}s as requested by the server`);
           await notifier.notifyError(error.message, delay);
-          await sleep(delay);
+          await pause(delay, 'rate limit');
           continue;
         }
 
@@ -94,7 +151,7 @@ export async function botCommand(rawOptions) {
           const delay = BLOCK_COOLDOWN_SECONDS[Math.min(blockFailureCount - 1, BLOCK_COOLDOWN_SECONDS.length - 1)];
           log(`WAF/anti-bot challenge detectado. Enfriando ${delay}s y renovando sesión (bloqueo #${blockFailureCount})`);
           await notifier.notifyError('WAF/anti-bot challenge', delay);
-          await sleep(delay);
+          await pause(delay, 'WAF');
           break;
         }
 
@@ -103,7 +160,7 @@ export async function botCommand(rawOptions) {
           const delay = backoffSeconds(TRANSIENT_BACKOFF_SECONDS, transientFailureCount);
           log(`Transient visa-site failure: ${error.message}. Retrying in ${delay}s`);
           if (transientFailureCount >= TRANSIENT_BACKOFF_SECONDS.length) break;
-          await sleep(delay);
+          await pause(delay, 'error transitorio');
           continue;
         }
 
@@ -149,7 +206,7 @@ function logSearchOptions(options) {
 }
 
 function isPermanentError(error) {
-  return ['ESCHEMA', 'ECONFIG', 'EBOOKING_UNVERIFIED', 'EHTTP'].includes(error?.code);
+  return ['ESCHEMA', 'ECONFIG', 'EBOOKING_UNVERIFIED', 'EHTTP', 'ECREDENTIALS', 'ELOCKED', 'ENOLIMIT'].includes(error?.code);
 }
 
 function backoffSeconds(steps, failureCount) {

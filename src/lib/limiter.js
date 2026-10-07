@@ -38,3 +38,49 @@ export async function rateLimit() {
   }
   // superado el máximo de espera -> proceder igual
 }
+
+// ---------------- límite de logins simultáneos ----------------
+// Todas las órdenes salen por la misma IP: muchos logins juntos provocan bloqueos del portal.
+// Semáforo entre procesos con archivos de "slot" en LOGIN_LOCK_DIR (opt-in, best-effort).
+const LOCK_DIR = process.env.LOGIN_LOCK_DIR || null;
+const MAX_LOGINS = Math.max(1, Number(process.env.MAX_CONCURRENT_LOGINS || 2));
+const LOCK_STALE_MS = 60000;     // un slot más viejo que esto es de un proceso que murió
+const LOCK_MAX_WAIT_MS = 90000;  // nunca esperar más que esto: se sigue sin slot
+
+let heldSlot = null;
+process.on('exit', () => { if (heldSlot) { try { fs.unlinkSync(heldSlot); } catch { /* noop */ } } });
+
+function tryAcquire() {
+  for (let i = 0; i < MAX_LOGINS; i++) {
+    const file = `${LOCK_DIR}/login-${i}.lock`;
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+      return file;
+    } catch {
+      try {
+        if (Date.now() - fs.statSync(file).mtimeMs > LOCK_STALE_MS) fs.unlinkSync(file);
+      } catch { /* noop */ }
+    }
+  }
+  return null;
+}
+
+export async function withLoginSlot(fn) {
+  if (LOCK_DIR) {
+    try { fs.mkdirSync(LOCK_DIR, { recursive: true }); } catch { /* noop */ }
+    const start = Date.now();
+    let waited = false;
+    while (!(heldSlot = tryAcquire()) && Date.now() - start < LOCK_MAX_WAIT_MS) {
+      waited = true;
+      await new Promise(r => setTimeout(r, 200 + Math.floor(Math.random() * 200)));
+    }
+    if (waited) console.log(`[${new Date().toISOString()}] ⏳ Esperé ${Math.round((Date.now() - start) / 1000)}s por un turno de login`);
+  }
+  try {
+    // jitter: separa logins de órdenes que arrancan juntas
+    await new Promise(r => setTimeout(r, Math.floor(Math.random() * 1500)));
+    return await fn();
+  } finally {
+    if (heldSlot) { try { fs.unlinkSync(heldSlot); } catch { /* noop */ } heldSlot = null; }
+  }
+}

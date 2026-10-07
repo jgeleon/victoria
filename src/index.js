@@ -29,7 +29,12 @@ program
   .option('--once', 'check availability once and exit')
   .action(botCommand);
 
+// Códigos que el supervisor no debe revivir:
+// 3 = credenciales/cuenta bloqueada, 4 = sin reprogramaciones
+// 5 = reserva sin verificar: hay que revisar el portal a mano antes de seguir
+const EXIT_CODES = { ECREDENTIALS: 3, ELOCKED: 3, ENOLIMIT: 4, EBOOKING_UNVERIFIED: 5 };
+
 program.parseAsync().catch(error => {
   console.error(`Error: ${error.message}`);
-  process.exitCode = 1;
+  process.exitCode = EXIT_CODES[error?.code] || 1;
 });

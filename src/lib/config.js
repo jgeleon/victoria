@@ -15,6 +15,8 @@ export function getConfig() {
     countryCode: process.env.COUNTRY_CODE?.trim().toLowerCase(),
     refreshDelay: Number(process.env.REFRESH_DELAY || 20),
     requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS || 15000),
+    minDaysFromToday: Number(process.env.MIN_DAYS_FROM_TODAY ?? 3),
+    dateFailuresFile: process.env.DATE_FAILURES_FILE || null,
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN,
     telegramChatId: process.env.TELEGRAM_CHAT_ID
   };

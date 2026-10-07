@@ -35,6 +35,24 @@ const USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 ];
 const USER_AGENT = USER_AGENTS[0];
+
+// Client hints que manda Chrome real (Safari/Firefox no los mandan). Reducen bloqueos del WAF.
+function clientHints(userAgent) {
+  const m = /Chrome\/(\d+)/.exec(userAgent || '');
+  if (!m) return {};
+  const platform = /Windows/.test(userAgent) ? 'Windows' : /Mac OS X/.test(userAgent) ? 'macOS' : 'Linux';
+  return {
+    'sec-ch-ua': `"Not(A:Brand";v="8", "Chromium";v="${m[1]}", "Google Chrome";v="${m[1]}"`,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': `"${platform}"`
+  };
+}
+
+// Timeouts por tipo de petición. El POST de reserva nunca se corta pronto: abortarlo deja
+// la duda de si el portal ya lo procesó.
+const TIMEOUT_PAGE_MS = 10000;
+const TIMEOUT_JSON_MS = 10000;
+const TIMEOUT_BOOKING_MS = 60000;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const TRANSIENT_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 
@@ -64,7 +82,12 @@ export class VisaHttpClient {
     this.fetch = options.fetch || fetch;
     this.cookies = new Map();
     this.csrfToken = null;
+    this.inFlight = 0;      // peticiones esperando respuesta (para el cierre ordenado)
+    this.stopping = false;  // en cierre: no se inician peticiones nuevas
     this.userAgent = options.userAgent || USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+    this.lang = /\/es-/.test(this.baseUri) ? 'es' : 'en';
+    this.rescheduleLimit = null; // { max, remaining } leído de la página de advertencia del portal
+    this.lastTrace = [];         // "status url" de la última petición (diagnóstico de sesión)
   }
 
   exportSession() {
@@ -120,6 +143,15 @@ export class VisaHttpClient {
     let loginHtml = await loginResponse.text();
     const javascriptRedirect = this._javascriptRedirect(loginHtml);
 
+    // Errores que NO se arreglan reintentando: cada intento fallido suma al bloqueo de la cuenta
+    const lockMatch = /account is locked until ([^<.]+)/i.exec(loginHtml) || /cuenta (?:est[aá] )?bloqueada hasta ([^<.]+)/i.exec(loginHtml);
+    if (lockMatch) {
+      throw new VisaClientError(`Cuenta bloqueada por el portal hasta ${lockMatch[1].trim()}`, 'ELOCKED');
+    }
+    if (!javascriptRedirect && (loginHtml.includes('sign_in_form') || /invalid email or password|correo electr[oó]nico o contrase[nñ]a (?:no v[aá]lidos|inv[aá]lidos)/i.test(loginHtml))) {
+      throw new VisaClientError('Email o contraseña incorrectos', 'ECREDENTIALS');
+    }
+
     if (javascriptRedirect) {
       loginResponse = await this._request(new URL(javascriptRedirect, signInUrl), {
         headers: { Accept: 'text/html,application/xhtml+xml' },
@@ -137,8 +169,10 @@ export class VisaHttpClient {
   }
 
   async verifyAccountContext(scheduleId) {
+    // Sin confirmed_limit_message: el portal muestra la advertencia con "Le quedan N intentos"
     const response = await this._request(this._appointmentUrl(scheduleId), {
-      headers: { Accept: 'text/html,application/xhtml+xml' }
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      timeoutMs: TIMEOUT_PAGE_MS
     });
     const html = await response.text();
 
@@ -147,6 +181,8 @@ export class VisaHttpClient {
     }
 
     this.csrfToken = this._findCsrfToken(html) || this.csrfToken;
+    const limit = parseRescheduleLimit(html);
+    if (limit.max !== null || limit.remaining !== null) this.rescheduleLimit = limit;
     return html;
   }
 
@@ -195,43 +231,52 @@ export class VisaHttpClient {
 
   async book(_headers, scheduleId, facilityId, date, time) {
     const url = this._appointmentUrl(scheduleId);
+    const formUrl = this._appointmentFormUrl(scheduleId);
 
     // Intento rápido: reutiliza el CSRF cacheado y evita el GET previo a la reserva
     if (this.csrfToken) {
-      const fast = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time));
-      const outcome = this._classifyBooking(fast.response.url, fast.body, date, time);
-      if (outcome === 'ok') return fast.response;
-      if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
-      // 'auth' / 'retry' -> reintenta con token fresco
-    }
-
-    // Camino con token fresco (GET a la página de cita -> POST -> verificación)
-    const appointmentResponse = await this._request(url, {
-      headers: { Accept: 'text/html,application/xhtml+xml' }
-    });
-    const appointmentHtml = await appointmentResponse.text();
-    this.csrfToken = this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
-
-    const { response, body } = await this._postBooking(url, this.csrfToken, this._buildBookingData(this.csrfToken, facilityId, date, time));
-
-    if (this._isSignInPage(response.url, body)) {
-      throw new VisaClientError('Session expired while booking', 'EAUTH');
-    }
-
-    this._handleBookingResponse(body);
-
-    const confirmationText = cheerio.load(body)('body').text().toLowerCase();
-    const hasPositiveConfirmation = confirmationText.includes('successfully') ||
-      confirmationText.includes('appointment confirmation') ||
-      (confirmationText.includes(date.toLowerCase()) && confirmationText.includes(time.toLowerCase()));
-
-    if (!hasPositiveConfirmation) {
-      const verified = await this._verifyBookedDate(scheduleId, date, time);
-      if (!verified) {
-        throw new VisaClientError('Booking response could not be verified; stopping to avoid a duplicate reschedule', 'EBOOKING_UNVERIFIED');
+      let fast = null;
+      try {
+        fast = await this._postBooking(url, formUrl, this._buildBookingData(this.csrfToken, facilityId, date, time));
+      } catch (err) {
+        // 422 = token CSRF rechazado: el portal NO procesó la reserva, se reintenta con token fresco
+        if (!(err?.code === 'EHTTP' && err.status === 422)) throw err;
+        log('Token CSRF rechazado (422); pidiendo el formulario para un token fresco');
+      }
+      if (fast) {
+        const outcome = this._classifyBooking(fast.response.url, fast.body, date, time);
+        if (outcome === 'ok') return fast.response;
+        if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
+        if (outcome === 'unknown') {
+          // No sabemos si reservó: un segundo POST podría gastar otra reprogramación (en Perú son limitadas)
+          throw new VisaClientError('Booking response could not be classified; stopping to avoid a duplicate reschedule', 'EBOOKING_UNVERIFIED');
+        }
+        // 'auth' / 'form' -> el portal no procesó la reserva; reintenta con token fresco
       }
     }
 
+    // Camino con token fresco: GET al formulario de cita -> POST
+    const appointmentResponse = await this._request(formUrl, {
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      timeoutMs: TIMEOUT_PAGE_MS
+    });
+    const appointmentHtml = await appointmentResponse.text();
+    if (this._isSignInPage(appointmentResponse.url, appointmentHtml)) {
+      throw new VisaClientError('Session expired while loading the appointment form', 'EAUTH');
+    }
+    this.csrfToken = this._findAuthenticityToken(appointmentHtml) || this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
+
+    const { response, body } = await this._postBooking(url, formUrl, this._buildBookingData(this.csrfToken, facilityId, date, time));
+    const outcome = this._classifyBooking(response.url, body, date, time);
+    if (outcome === 'ok') return response;
+    if (outcome === 'auth') throw new VisaClientError('Session expired while booking', 'EAUTH');
+    if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
+    if (outcome === 'form') throw new VisaClientError('Booking failed; the portal re-rendered the appointment form', 'ESLOT_UNAVAILABLE');
+
+    const verified = await this._verifyBookedDate(scheduleId, date, time);
+    if (!verified) {
+      throw new VisaClientError('Booking response could not be verified; stopping to avoid a duplicate reschedule', 'EBOOKING_UNVERIFIED');
+    }
     return response;
   }
 
@@ -244,38 +289,54 @@ export class VisaHttpClient {
       'appointments[consulate_appointment][facility_id]': facilityId,
       'appointments[consulate_appointment][date]': date,
       'appointments[consulate_appointment][time]': time,
-      'appointments[asc_appointment][facility_id]': '',
-      'appointments[asc_appointment][date]': '',
-      'appointments[asc_appointment][time]': ''
+      // Perú no usa CAS: el formulario real no trae campos asc_appointment.
+      // commit = texto del botón; es-pe lo exige (reprogramaciones limitadas).
+      commit: this.lang === 'es' ? 'Reprogramar' : 'Reschedule'
     };
   }
 
-  async _postBooking(url, csrfToken, bookingData) {
-    const response = await this._request(url, {
-      method: 'POST',
-      headers: {
-        Accept: 'text/html,application/xhtml+xml',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        Origin: new URL(this.baseUri).origin,
-        Referer: url,
-        'X-CSRF-Token': csrfToken
-      },
-      body: new URLSearchParams(bookingData)
-    });
+  async _postBooking(url, referer, bookingData) {
+    let response;
+    try {
+      response = await this._request(url, {
+        method: 'POST',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          Origin: new URL(this.baseUri).origin,
+          Referer: referer,
+          'X-CSRF-Token': bookingData.authenticity_token
+        },
+        body: new URLSearchParams(bookingData),
+        timeoutMs: TIMEOUT_BOOKING_MS
+      });
+    } catch (err) {
+      // Timeout o caída de red durante el POST: no se sabe si el portal lo procesó
+      if (err?.code === 'ETRANSIENT') {
+        throw new VisaClientError(`Booking POST did not complete (${err.message}); the portal may have processed it`, 'EBOOKING_UNVERIFIED', { cause: err });
+      }
+      throw err;
+    }
     const body = await response.text();
     return { response, body };
   }
 
-  // Clasifica la respuesta de reserva sin lanzar: 'ok' | 'slot' | 'auth' | 'retry'
+  // Clasifica la respuesta de reserva sin lanzar:
+  //   'ok'      reservó (redirección a /instructions o texto de éxito)
+  //   'slot'    el portal dijo que el cupo ya no está
+  //   'auth'    sesión caída (no procesó)
+  //   'form'    volvió el formulario de cita sin éxito (no procesó)
+  //   'unknown' no se reconoce: NO se debe repetir el POST
   _classifyBooking(url, body, date, time) {
+    if (/\/appointment\/instructions/.test(String(url))) return 'ok';
     if (this._isSignInPage(url, body)) return 'auth';
     const normalized = cheerio.load(body)('body').text().toLowerCase();
-    const failures = ['not available', 'no longer available', 'please try again', 'unable to', 'invalid appointment'];
-    if (failures.some(m => normalized.includes(m))) return 'slot';
-    const positive = normalized.includes('successfully') ||
-      normalized.includes('appointment confirmation') ||
+    if (BOOKING_FAILURES.some(m => normalized.includes(m))) return 'slot';
+    const positive = BOOKING_SUCCESS.some(m => normalized.includes(m)) ||
       (normalized.includes(date.toLowerCase()) && normalized.includes(time.toLowerCase()));
-    return positive ? 'ok' : 'retry';
+    if (positive) return 'ok';
+    if (String(body).includes('appointments[consulate_appointment][date]')) return 'form';
+    return 'unknown';
   }
 
   _looksLikeChallenge(html = '') {
@@ -295,7 +356,8 @@ export class VisaHttpClient {
         'Sec-Fetch-Site': 'same-origin',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Dest': 'empty'
-      }
+      },
+      timeoutMs: TIMEOUT_JSON_MS
     });
     const contentType = String(response.headers.get('content-type') || '').toLowerCase();
     const text = await response.text();
@@ -326,16 +388,30 @@ export class VisaHttpClient {
   }
 
   async _request(initialUrl, options = {}) {
+    // En cierre no se inicia nada nuevo: el proceso sale en cuanto se guarde la sesión
+    if (this.stopping) await new Promise(() => {});
+    this.inFlight += 1;
+    try {
+      return await this._requestOnce(initialUrl, options);
+    } finally {
+      this.inFlight -= 1;
+    }
+  }
+
+  async _requestOnce(initialUrl, options = {}) {
     let url = String(initialUrl);
     let requestOptions = { ...options, headers: { ...options.headers } };
     let usingProxy = !!options.useProxy && loginProxyEnabled();
     let proxyFellBack = false;
+    const timeoutMs = options.timeoutMs || this.requestTimeoutMs;
     delete requestOptions.useProxy;
+    delete requestOptions.timeoutMs;
+    this.lastTrace = [];
 
     for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
       await rateLimit();
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
       const requestAgent = usingProxy ? (makeProxyAgent() || keepAliveAgent) : keepAliveAgent;
       let response;
 
@@ -348,6 +424,7 @@ export class VisaHttpClient {
           headers: {
             ...COMMON_HEADERS,
             'User-Agent': this.userAgent,
+            ...clientHints(this.userAgent),
             ...(usingProxy ? { Connection: 'close' } : {}),
             ...requestOptions.headers,
             ...(this.cookies.size ? { Cookie: this._cookieHeader() } : {})
@@ -361,7 +438,7 @@ export class VisaHttpClient {
           continue;
         }
         if (error?.name === 'AbortError' || error?.type === 'aborted') {
-          throw new VisaClientError(`Request timed out after ${this.requestTimeoutMs}ms`, 'ETRANSIENT', { cause: error });
+          throw new VisaClientError(`Request timed out after ${timeoutMs}ms`, 'ETRANSIENT', { cause: error });
         }
         throw new VisaClientError(`Network request failed: ${error.message}`, 'ETRANSIENT', { cause: error });
       } finally {
@@ -369,6 +446,7 @@ export class VisaHttpClient {
       }
 
       this._storeCookies(response);
+      this.lastTrace.push(`${response.status} ${new URL(url).pathname}${REDIRECT_STATUSES.has(response.status) ? ` -> ${response.headers.get('location') || '?'}` : ''}`);
 
       if (REDIRECT_STATUSES.has(response.status) && response.headers.get('location')) {
         if (redirectCount === 5) {
@@ -466,21 +544,22 @@ export class VisaHttpClient {
 
   _handleBookingResponse(html) {
     const normalized = cheerio.load(html)('body').text().toLowerCase();
-    const failures = ['not available', 'no longer available', 'please try again', 'unable to', 'invalid appointment'];
-    const matched = failures.find(message => normalized.includes(message));
+    const matched = BOOKING_FAILURES.find(message => normalized.includes(message));
     if (matched) {
       throw new VisaClientError(`Booking failed; visa site response included "${matched}"`, 'ESLOT_UNAVAILABLE');
     }
   }
 
   async _verifyBookedDate(scheduleId, date, time) {
-    const response = await this._request(this._appointmentUrl(scheduleId), {
-      headers: { Accept: 'text/html,application/xhtml+xml' }
+    const response = await this._request(this._appointmentFormUrl(scheduleId), {
+      headers: { Accept: 'text/html,application/xhtml+xml' },
+      timeoutMs: TIMEOUT_PAGE_MS
     });
     const html = (await response.text()).toLowerCase();
     const text = cheerio.load(html)('body').text().toLowerCase();
-    return (html.includes(date.toLowerCase()) || text.includes(date.toLowerCase())) &&
-      (html.includes(time.toLowerCase()) || text.includes(time.toLowerCase()));
+    const dateForms = [date.toLowerCase(), ...humanDates(date, this.lang)];
+    const hasDate = dateForms.some(d => html.includes(d) || text.includes(d));
+    return hasDate && (html.includes(time.toLowerCase()) || text.includes(time.toLowerCase()));
   }
 
   _retryAfterSeconds(response) {
@@ -503,4 +582,56 @@ export class VisaHttpClient {
   _appointmentUrl(scheduleId) {
     return `${this.baseUri}/schedule/${encodeURIComponent(scheduleId)}/appointment`;
   }
+
+  // Formulario de cita. Sin confirmed_limit_message el portal muestra antes la advertencia de límite.
+  _appointmentFormUrl(scheduleId) {
+    const commit = this.lang === 'es' ? 'Continuar' : 'Continue';
+    return `${this._appointmentUrl(scheduleId)}?confirmed_limit_message=1&commit=${commit}`;
+  }
+
+  _findAuthenticityToken(html) {
+    return cheerio.load(html)('input[name="authenticity_token"]').attr('value');
+  }
+}
+
+const BOOKING_FAILURES = [
+  'not available', 'no longer available', 'please try again', 'unable to', 'invalid appointment',
+  'no está disponible', 'ya no está disponible', 'no esta disponible', 'intente de nuevo', 'inténtelo de nuevo', 'no se pudo'
+];
+const BOOKING_SUCCESS = [
+  'successfully', 'appointment confirmation', 'programado exitosamente', 'programó exitosamente', 'reprogramado exitosamente'
+];
+
+const MONTHS = {
+  en: ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'],
+  es: ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre']
+};
+
+// "2028-02-04" -> ["4 february, 2028", "04 february, 2028", ...] como lo escribe el portal
+export function humanDates(ymd, lang = 'en') {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!m) return [];
+  const [, y, mo, d] = m;
+  const month = (MONTHS[lang] || MONTHS.en)[Number(mo) - 1];
+  const days = [String(Number(d)), d];
+  return days.flatMap(day => [`${day} ${month}, ${y}`, `${day} ${month} ${y}`, `${day} de ${month} de ${y}`]);
+}
+
+/**
+ * Tope de reprogramaciones, leído de la página de ADVERTENCIA (/appointment sin
+ * confirmed_limit_message). Texto real de es-pe:
+ *   "Hay un numero maximo de 2 cancelaciones/reprogramaciones ... Le quedan 1 intentos ..."
+ */
+export function parseRescheduleLimit(html) {
+  const entities = { '&nbsp;': ' ', '&aacute;': 'a', '&eacute;': 'e', '&iacute;': 'i', '&oacute;': 'o', '&uacute;': 'u', '&ntilde;': 'n', '&amp;': '&' };
+  const t = String(html || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z]+;/gi, e => entities[e.toLowerCase()] ?? ' ')
+    .replace(/\s+/g, ' ');
+  const max = t.match(/n[uú]mero m[aá]ximo de\s+(\d+)/i) ?? t.match(/maximum (?:number )?of\s+(\d+)\s+(?:cancellation|reschedul)/i);
+  const remaining = t.match(/le quedan\s+(\d+)/i) ??
+    t.match(/you have\s+(\d+)\s+(?:attempts?|reschedules?)\s+remaining/i) ??
+    t.match(/(\d+)\s+(?:attempts?|intentos?)\s+(?:remaining|restantes?)/i) ??
+    t.match(/you have\s+(\d+)\s+(?:attempts?|reschedules?)\s+left/i);
+  return { max: max ? Number(max[1]) : null, remaining: remaining ? Number(remaining[1]) : null };
 }
