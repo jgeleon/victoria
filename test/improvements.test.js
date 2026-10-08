@@ -6,7 +6,7 @@ import path from 'path';
 import { Response } from 'node-fetch';
 import { VisaHttpClient, parseRescheduleLimit } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
-import { errorSpacingSeconds, focusDelaySeconds, parseFocusWindow } from '../src/commands/bot.js';
+import { createNapper, errorSpacingSeconds, focusDelaySeconds, parseFocusWindow } from '../src/commands/bot.js';
 
 function response(body, options, url) {
   const r = new Response(body, options);
@@ -151,4 +151,19 @@ test('a booking POST that times out stops as unverified instead of retrying', as
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   client.csrfToken = 'tok';
   await assert.rejects(() => client.book({}, '123', '115', '2026-11-10', '09:00'), { code: 'EBOOKING_UNVERIFIED' });
+});
+
+test('a mode switch wakes the bot from its current pause', async () => {
+  const napper = createNapper();
+  const start = Date.now();
+  const pause = napper.nap(30);
+  setTimeout(() => napper.wake(), 50);
+  await pause;
+  assert.ok(Date.now() - start < 1000);
+});
+
+test('when every facility fails the poll is an error, not "no dates"', async () => {
+  const client = { checkAvailableDate: async () => { const e = new Error('Network request failed'); e.code = 'ETRANSIENT'; throw e; } };
+  const bot = new Bot(cfg(), { client });
+  await assert.rejects(() => bot.checkAvailableDates({}, '2027-06-01', null, null), { code: 'ETRANSIENT' });
 });

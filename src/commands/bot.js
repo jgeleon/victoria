@@ -7,6 +7,8 @@ const SESSION_BACKOFF_SECONDS = [15, 30, 60, 90];
 const TRANSIENT_BACKOFF_SECONDS = [5, 10, 20, 30];
 const BLOCK_COOLDOWN_SECONDS = [30, 120, 300, 600];
 const JITTER_FACTOR = 0.2;
+// Dormido: sin peticiones, sesión en memoria. Cada tanto una consulta para que no caduque.
+const IDLE_KEEPALIVE_SECONDS = 10 * 60;
 
 // Con errores seguidos se espacian los intentos: insistir contra un bloqueo lo alarga.
 // Se vuelve al ritmo normal con el primer sondeo exitoso.
@@ -16,6 +18,21 @@ export function errorSpacingSeconds(streak) {
   if (streak < 30) return 120;
   if (streak < 50) return 300;
   return 600;
+}
+
+// Pausa entre consultas que se puede interrumpir (cambio de modo en caliente).
+export function createNapper() {
+  let wakeUp = null;
+  return {
+    nap(seconds) {
+      return new Promise((resolve) => {
+        const finish = (woken) => { clearTimeout(timer); wakeUp = null; resolve(woken); };
+        const timer = setTimeout(() => finish(false), Math.max(0, seconds) * 1000);
+        wakeUp = () => finish(true);
+      });
+    },
+    wake() { if (wakeUp) wakeUp(); }
+  };
 }
 
 // Ventana de liberación (ej. "13-26": segundos 13 a 25 de cada minuto). Fuera de ella se
@@ -43,15 +60,47 @@ export async function botCommand(rawOptions) {
   const config = getConfig();
   const bot = new Bot(config, { dryRun: options.dryRun, sessionFile: process.env.SESSION_FILE });
   const notifier = new Notifier(config);
-  const focusWindow = parseFocusWindow(process.env.FOCUS_WINDOW);
+  // Ritmo actual. El supervisor lo cambia en caliente (normal <-> boost) por IPC, sin reiniciar
+  // el proceso: así la sesión y las conexiones abiertas se conservan.
+  let delaySeconds = config.refreshDelay;
+  let focusWindow = parseFocusWindow(process.env.FOCUS_WINDOW);
+  const napper = createNapper();
+  let idle = false;
 
-  // El supervisor corta los ciclos/boost con SIGTERM: esperar la petición en vuelo y
-  // persistir la última cookie antes de salir
-  process.once('SIGTERM', async () => {
-    log('🔒 Cerrando: guardando la sesión antes de salir');
+  // Cierre ordenado: esperar la petición en vuelo y persistir la última cookie antes de salir.
+  // Llega por IPC ({type:'stop'}, funciona en Windows) o por SIGTERM (Linux/macOS).
+  let closing = false;
+  const closeGracefully = async (reason) => {
+    if (closing) return;
+    closing = true;
+    log(`🔒 Cerrando (${reason}): guardando la sesión antes de salir`);
     await bot.shutdown();
     process.exit(143);
-  });
+  };
+  process.once('SIGTERM', () => closeGracefully('SIGTERM'));
+
+  if (process.send) {
+    process.on('message', (msg) => {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'stop') { closeGracefully('orden del supervisor'); return; }
+      if (msg.type === 'mode' && msg.mode === 'idle') {
+        idle = true;
+        log('💤 En espera: sin consultas, la sesión queda abierta en memoria');
+        napper.wake();
+        return;
+      }
+      if (msg.type === 'mode') {
+        idle = false;
+        const d = Number(msg.delay);
+        if (Number.isFinite(d) && d > 0) delaySeconds = d;
+        focusWindow = parseFocusWindow(msg.focusWindow);
+        log(`${msg.mode === 'boost' ? '⚡ Modo BOOST' : '▶ Modo normal'} en el mismo proceso: delay ${delaySeconds}s${focusWindow ? `, ventana s${focusWindow.start}-${focusWindow.end - 1}` : ''} (sesión conservada)`);
+        napper.wake(); // aplicar el ritmo nuevo ya, sin esperar a que termine la pausa actual
+      }
+    });
+    // Si el supervisor muere, no quedar huérfano consultando el portal
+    process.on('disconnect', () => closeGracefully('el supervisor se desconectó'));
+  }
 
   if (notifier.isEnabled()) log('Telegram notifications enabled');
   logSearchOptions(options);
@@ -95,6 +144,11 @@ export async function botCommand(rawOptions) {
 
     while (true) {
       try {
+        if (idle) {
+          const woken = await napper.nap(IDLE_KEEPALIVE_SECONDS);
+          if (idle && !woken) log('💤 Consulta de mantenimiento para que la sesión no caduque');
+          else if (idle) continue;
+        }
         const availableDates = await bot.checkAvailableDates(
           sessionHeaders,
           options.current,
@@ -125,7 +179,7 @@ export async function botCommand(rawOptions) {
           return;
         }
 
-        await sleep(focusDelaySeconds(jitterSeconds(config.refreshDelay), focusWindow));
+        if (!idle) await napper.nap(focusDelaySeconds(jitterSeconds(delaySeconds), focusWindow));
       } catch (error) {
         if (error.code === 'EAUTH') {
           if (bot.reusedSession) {

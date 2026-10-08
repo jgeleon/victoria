@@ -412,7 +412,7 @@ export class VisaHttpClient {
       await rateLimit();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
-      const requestAgent = usingProxy ? (makeProxyAgent() || keepAliveAgent) : keepAliveAgent;
+      const requestAgent = url.startsWith('http:') ? undefined : (usingProxy ? (makeProxyAgent() || keepAliveAgent) : keepAliveAgent);
       let response;
 
       try {

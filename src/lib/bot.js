@@ -139,6 +139,8 @@ export class Bot {
     const currentKey = currentBookedDate ? dateKey(currentBookedDate) : null;
 
     const candidates = [];
+    let lastError = null;
+    let failed = 0;
     for (const facilityId of facilityIds) {
       let dates;
       try {
@@ -152,6 +154,8 @@ export class Bot {
         // Un consulado puede fallar sin tumbar al resto; los bloqueos/sesión sí se propagan.
         if (['EAUTH', 'ERATELIMIT', 'EBLOCK'].includes(err?.code)) throw err;
         log(`facility ${facilityId}: error consultando fechas (${err.message})`);
+        lastError = err;
+        failed += 1;
         continue;
       }
 
@@ -171,6 +175,9 @@ export class Bot {
       }
       log(`facility ${facilityId}: ${good} fechas válidas de ${dates.length} (rechazadas=${JSON.stringify(rejected)}${floorDate ? `, piso=${floorDate}` : ''})`);
     }
+
+    // Si ningún consulado respondió no es "sin fechas": es un fallo, y el bucle debe frenar
+    if (failed === facilityIds.length && lastError) throw lastError;
 
     if (candidates.length === 0) {
       log('No qualifying dates across facilities');

@@ -62,5 +62,7 @@ function configError(message) {
 }
 
 export function getBaseUri(countryCode) {
+  // VISA_BASE_URI solo para pruebas contra un portal simulado local
+  if (process.env.VISA_BASE_URI) return process.env.VISA_BASE_URI;
   return `https://ais.usvisa-info.com/en-${countryCode}/niv`;
 }

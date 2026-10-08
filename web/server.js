@@ -176,7 +176,7 @@ function detectBooking(o, line) {
     ctrl.booked = true;
     if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
-    if (ctrl.child) ctrl.child.kill('SIGTERM');
+    if (ctrl.child) stopChild(ctrl);
     else endCycle(o, ctrl, 'booked', '🎫 Cita reservada. Proceso detenido.');
   }
 }
@@ -221,7 +221,29 @@ function spawnChild(o, { refreshDelay, focusWindow } = {}) {
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
   const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), LOGIN_LOCK_DIR: path.join(DATA_DIR, 'locks'), DATE_FAILURES_FILE: path.join(DATA_DIR, 'datefail', `${o.id}.json`), FOCUS_WINDOW: focusWindow || '', GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
-  return { cp: spawn(process.execPath, args, { cwd: PROJECT_ROOT, env }), command: `node src/index.js ${args.slice(1).join(' ')}` };
+  // 'ipc': canal para cambiar de modo (normal <-> boost) y pedir un cierre ordenado sin matar
+  // el proceso. Funciona igual en Windows, donde SIGTERM mata de golpe.
+  const cp = spawn(process.execPath, args, { cwd: PROJECT_ROOT, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  return { cp, command: `node src/index.js ${args.slice(1).join(' ')}` };
+}
+
+function childConnected(ctrl) { return !!(ctrl.child && ctrl.child.connected); }
+
+function sendToChild(ctrl, msg) {
+  if (!childConnected(ctrl)) return false;
+  try { ctrl.child.send(msg); return true; } catch { return false; }
+}
+
+// Cierre ordenado: el bot guarda la sesión y sale. Si no responde, se fuerza.
+function stopChild(ctrl) {
+  const cp = ctrl.child;
+  if (!cp) return;
+  if (sendToChild(ctrl, { type: 'stop' })) {
+    const t = setTimeout(() => { if (ctrl.child === cp) cp.kill('SIGTERM'); }, 8000);
+    cp.once('exit', () => clearTimeout(t));
+  } else {
+    cp.kill('SIGTERM');
+  }
 }
 
 // ms hasta el próximo disparo: cada 'step' minutos, alineado al reloj del servidor
@@ -298,17 +320,87 @@ function onWeeklyFire(o, ctrl) {
   startBoostNow(o, ctrl, WEEKLY_LIFE_MS);
 }
 
-// Arranca un boost ya: si hay run activo lo corta y el exit handler lo lanza.
+// Arranca un boost ya. Si hay un proceso vivo, se le cambia el ritmo EN CALIENTE (misma sesión,
+// sin login). Solo si no hay proceso se lanza uno nuevo.
 function startBoostNow(o, ctrl, lifeMs) {
   ctrl.pendingLifeMs = lifeMs || 0;
-  if (ctrl.child) {
+  if (childConnected(ctrl)) {
+    switchToBoost(o, ctrl, ctrl.pendingLifeMs);
+  } else if (ctrl.child) {
+    // proceso sin canal IPC (no debería pasar): reinicio clásico
     ctrl.pendingBoost = true;
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
-    ctrl.child.kill('SIGTERM');
+    stopChild(ctrl);
   } else {
     if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
     beginRun(o, ctrl, 'boost', { lifeMs: ctrl.pendingLifeMs });
   }
+  pushOrderUpdate(o); broadcastState();
+}
+
+function boostFocusWindow(o) { return o.boostFocus ? FOCUS_WINDOW_PE : ''; }
+
+// Fin del ciclo normal: el proceso NO se cierra. Queda dormido con la sesión en memoria y el
+// próximo ciclo o boost lo despierta sin login. Mismas reglas que cuando el proceso salía.
+function normalCycleDone(o, ctrl) {
+  ctrl.durationTimer = null;
+  if (!childConnected(ctrl)) { if (ctrl.child) { ctrl.durationHit = true; stopChild(ctrl); } return; }
+  if (ctrl.normalIntervalMs > 0) {
+    sendToChild(ctrl, { type: 'mode', mode: 'idle' });
+    const wait = Math.max(0, ctrl.normalIntervalMs - (Date.now() - ctrl.cycleStart));
+    ctrl.phase = 'paused';
+    ctrl.reviveAt = Date.now() + wait;
+    appendLog(ctrl.runId, `⏸ Ciclo detenido. Revive en ${Math.round(wait / 1000)} s (proceso dormido, sesión abierta).`);
+    pushOrderUpdate(o); broadcastState();
+    ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; resumeNormal(o, ctrl); }, wait);
+  } else if (ctrl.boostEnabled || ctrl.weeklyEnabled) {
+    sendToChild(ctrl, { type: 'mode', mode: 'idle' });
+    restWaiting(o, ctrl, '⏸ Ciclo normal cumplido. Proceso dormido con la sesión abierta; el boost lo despierta.');
+  } else {
+    ctrl.durationHit = true;
+    stopChild(ctrl); // sin repetición ni boost: termina como antes
+  }
+}
+
+// Despierta el proceso dormido en modo normal y arranca la duración del ciclo.
+function resumeNormal(o, ctrl) {
+  if (!childConnected(ctrl)) { beginRun(o, ctrl, 'normal'); return; }
+  sendToChild(ctrl, { type: 'mode', mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' });
+  ctrl.mode = 'normal';
+  ctrl.phase = 'running';
+  ctrl.cycleStart = Date.now();
+  ctrl.reviveAt = 0;
+  ctrl.blocked = false;
+  appendLog(ctrl.runId, `▶ Ciclo reanudado en el mismo proceso (sin login)${ctrl.normalDurationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
+  if (ctrl.normalDurationMs > 0) ctrl.durationTimer = setTimeout(() => normalCycleDone(o, ctrl), ctrl.normalDurationMs);
+  pushOrderUpdate(o); broadcastState();
+}
+
+function switchToBoost(o, ctrl, lifeMs) {
+  const life = lifeMs || ctrl.boostLifeMs;
+  if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+  if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+  ctrl.reviveAt = 0;
+  const focusWindow = boostFocusWindow(o);
+  sendToChild(ctrl, { type: 'mode', mode: 'boost', delay: ctrl.boostDelay, focusWindow });
+  ctrl.mode = 'boost';
+  ctrl.phase = 'boost';
+  appendLog(ctrl.runId, `⚡ BOOST en el mismo proceso: la sesión se conserva (vida ${Math.round(life / 6000) / 10} min, delay ${ctrl.boostDelay}s${focusWindow ? `, ventana s${focusWindow}` : ''}).`);
+  ctrl.durationTimer = setTimeout(() => endBoostInPlace(o, ctrl), life);
+  pushOrderUpdate(o); broadcastState();
+}
+
+// Fin del boost: el mismo proceso vuelve al ritmo normal y arranca su duración normal.
+function endBoostInPlace(o, ctrl) {
+  ctrl.durationTimer = null;
+  if (!childConnected(ctrl)) { stopChild(ctrl); return; } // el exit handler retoma el ciclo
+  sendToChild(ctrl, { type: 'mode', mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' });
+  ctrl.mode = 'normal';
+  ctrl.phase = 'running';
+  ctrl.cycleStart = Date.now();
+  ctrl.blocked = false;
+  appendLog(ctrl.runId, `⚡ Boost finalizado. Sigo en modo normal con la misma sesión${ctrl.normalDurationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}.`);
+  if (ctrl.normalDurationMs > 0) ctrl.durationTimer = setTimeout(() => normalCycleDone(o, ctrl), ctrl.normalDurationMs);
   pushOrderUpdate(o); broadcastState();
 }
 
@@ -380,7 +472,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
   const isBoost = mode === 'boost';
   const durationMs = isBoost ? (lifeMs || ctrl.boostLifeMs) : ctrl.normalDurationMs;
   const delay = isBoost ? ctrl.boostDelay : (o.refreshDelay || '3');
-  const focusWindow = isBoost && o.boostFocus ? FOCUS_WINDOW_PE : '';
+  const focusWindow = isBoost ? boostFocusWindow(o) : '';
   const { cp, command } = spawnChild(o, { refreshDelay: delay, focusWindow });
   ctrl.child = cp;
   ctrl.phase = isBoost ? 'boost' : 'running';
@@ -392,7 +484,9 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
   pushOrderUpdate(o); broadcastState();
 
   if (durationMs > 0) {
-    ctrl.durationTimer = setTimeout(() => { if (ctrl.child) { ctrl.durationHit = true; ctrl.child.kill('SIGTERM'); } }, durationMs);
+    ctrl.durationTimer = isBoost
+      ? setTimeout(() => endBoostInPlace(o, ctrl), durationMs)
+      : setTimeout(() => normalCycleDone(o, ctrl), durationMs);
   }
 
   let outBuf = '', errBuf = '';
@@ -414,6 +508,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
     if (errBuf) { appendLog(ctrl.runId, `[err] ${errBuf}`); detectBlock(o, errBuf); }
     ctrl.child = null;
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
     const wasBoost = ctrl.mode === 'boost';
     ctrl.durationHit = false;
 
@@ -499,7 +594,7 @@ function stopOrder(id) {
   if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
   if (ctrl.boostTimer) { clearTimeout(ctrl.boostTimer); ctrl.boostTimer = null; }
   if (ctrl.weeklyTimer) { clearTimeout(ctrl.weeklyTimer); ctrl.weeklyTimer = null; }
-  if (ctrl.child) { ctrl.child.kill('SIGTERM'); }        // el exit handler llama endCycle
+  if (ctrl.child) { stopChild(ctrl); }                   // el exit handler llama endCycle
   else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa/espera
   return { ok: true };
 }
