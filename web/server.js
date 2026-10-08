@@ -235,15 +235,39 @@ function sendToChild(ctrl, msg) {
 }
 
 // Cierre ordenado: el bot guarda la sesión y sale. Si no responde, se fuerza.
-function stopChild(ctrl) {
+// fast (detener por el usuario): el bot espera 1 s como máximo y se fuerza a los 2.5 s.
+// force: el bot no responde mensajes (no confirmó un modo), así que tampoco atendería 'stop'.
+function stopChild(ctrl, { fast = false, force = false } = {}) {
   const cp = ctrl.child;
   if (!cp) return;
-  if (sendToChild(ctrl, { type: 'stop' })) {
-    const t = setTimeout(() => { if (ctrl.child === cp) cp.kill('SIGTERM'); }, 8000);
+  clearAck(ctrl);
+  if (!force && sendToChild(ctrl, { type: 'stop', fast })) {
+    const t = setTimeout(() => { if (ctrl.child === cp) cp.kill('SIGTERM'); }, fast ? 2500 : 8000);
     cp.once('exit', () => clearTimeout(t));
   } else {
     cp.kill('SIGTERM');
   }
+}
+
+// Cambio de modo en caliente con confirmación. Si el bot no confirma (código viejo, canal
+// caído), se ejecuta fallback(): reiniciar el proceso con la configuración correcta.
+const MODE_ACK_MS = 4000;
+function clearAck(ctrl) { if (ctrl.ackTimer) { clearTimeout(ctrl.ackTimer); ctrl.ackTimer = null; } ctrl.awaitingAck = null; }
+function sendMode(o, ctrl, msg, fallback) {
+  clearAck(ctrl);
+  if (!sendToChild(ctrl, { type: 'mode', ...msg })) { fallback(); return false; }
+  const cp = ctrl.child;
+  ctrl.awaitingAck = msg.mode;
+  ctrl.ackTimer = setTimeout(() => {
+    ctrl.ackTimer = null; ctrl.awaitingAck = null;
+    if (ctrl.child !== cp || ctrl.userStopped) return;
+    appendLog(ctrl.runId, `⚠️ El bot no confirmó el modo ${msg.mode} (¿código del bot desactualizado?). Reinicio el proceso con la configuración correcta.`);
+    fallback();
+  }, MODE_ACK_MS);
+  return true;
+}
+function onChildMessage(ctrl, m) {
+  if (m && m.type === 'mode-ack' && m.mode === ctrl.awaitingAck) clearAck(ctrl);
 }
 
 // ms hasta el próximo disparo: cada 'step' minutos, alineado al reloj del servidor
@@ -345,8 +369,9 @@ function boostFocusWindow(o) { return o.boostFocus ? FOCUS_WINDOW_PE : ''; }
 function normalCycleDone(o, ctrl) {
   ctrl.durationTimer = null;
   if (!childConnected(ctrl)) { if (ctrl.child) { ctrl.durationHit = true; stopChild(ctrl); } return; }
+  const idleFallback = () => { ctrl.durationHit = true; stopChild(ctrl, { force: true }); };
   if (ctrl.normalIntervalMs > 0) {
-    sendToChild(ctrl, { type: 'mode', mode: 'idle' });
+    sendMode(o, ctrl, { mode: 'idle' }, idleFallback);
     const wait = Math.max(0, ctrl.normalIntervalMs - (Date.now() - ctrl.cycleStart));
     ctrl.phase = 'paused';
     ctrl.reviveAt = Date.now() + wait;
@@ -354,7 +379,7 @@ function normalCycleDone(o, ctrl) {
     pushOrderUpdate(o); broadcastState();
     ctrl.pauseTimer = setTimeout(() => { ctrl.pauseTimer = null; resumeNormal(o, ctrl); }, wait);
   } else if (ctrl.boostEnabled || ctrl.weeklyEnabled) {
-    sendToChild(ctrl, { type: 'mode', mode: 'idle' });
+    sendMode(o, ctrl, { mode: 'idle' }, idleFallback);
     restWaiting(o, ctrl, '⏸ Ciclo normal cumplido. Proceso dormido con la sesión abierta; el boost lo despierta.');
   } else {
     ctrl.durationHit = true;
@@ -365,7 +390,7 @@ function normalCycleDone(o, ctrl) {
 // Despierta el proceso dormido en modo normal y arranca la duración del ciclo.
 function resumeNormal(o, ctrl) {
   if (!childConnected(ctrl)) { beginRun(o, ctrl, 'normal'); return; }
-  sendToChild(ctrl, { type: 'mode', mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' });
+  sendMode(o, ctrl, { mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' }, () => { ctrl.pendingNormal = true; stopChild(ctrl, { force: true }); });
   ctrl.mode = 'normal';
   ctrl.phase = 'running';
   ctrl.cycleStart = Date.now();
@@ -382,11 +407,17 @@ function switchToBoost(o, ctrl, lifeMs) {
   if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
   ctrl.reviveAt = 0;
   const focusWindow = boostFocusWindow(o);
-  sendToChild(ctrl, { type: 'mode', mode: 'boost', delay: ctrl.boostDelay, focusWindow });
   ctrl.mode = 'boost';
   ctrl.phase = 'boost';
   appendLog(ctrl.runId, `⚡ BOOST en el mismo proceso: la sesión se conserva (vida ${Math.round(life / 6000) / 10} min, delay ${ctrl.boostDelay}s${focusWindow ? `, ventana s${focusWindow}` : ''}).`);
   ctrl.durationTimer = setTimeout(() => endBoostInPlace(o, ctrl), life);
+  sendMode(o, ctrl, { mode: 'boost', delay: ctrl.boostDelay, focusWindow }, () => {
+    // el bot no aplicó el boost: relanzarlo ya en modo boost (nace con el delay del boost)
+    if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
+    ctrl.pendingBoost = true;
+    ctrl.pendingLifeMs = life;
+    stopChild(ctrl, { force: true });
+  });
   pushOrderUpdate(o); broadcastState();
 }
 
@@ -394,7 +425,7 @@ function switchToBoost(o, ctrl, lifeMs) {
 function endBoostInPlace(o, ctrl) {
   ctrl.durationTimer = null;
   if (!childConnected(ctrl)) { stopChild(ctrl); return; } // el exit handler retoma el ciclo
-  sendToChild(ctrl, { type: 'mode', mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' });
+  sendMode(o, ctrl, { mode: 'normal', delay: o.refreshDelay || '3', focusWindow: '' }, () => { ctrl.pendingNormal = true; stopChild(ctrl, { force: true }); });
   ctrl.mode = 'normal';
   ctrl.phase = 'running';
   ctrl.cycleStart = Date.now();
@@ -500,6 +531,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
     }
     if (isErr) errBuf = buf; else outBuf = buf;
   };
+  cp.on('message', (m) => onChildMessage(ctrl, m));
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
@@ -509,6 +541,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
     ctrl.child = null;
     if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
     if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
+    clearAck(ctrl);
     const wasBoost = ctrl.mode === 'boost';
     ctrl.durationHit = false;
 
@@ -517,6 +550,9 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
 
     // Errores que reintentar no arregla: no revivir la orden
     if (FATAL_EXITS[code]) { endCycle(o, ctrl, FATAL_EXITS[code].status, FATAL_EXITS[code].msg); return; }
+
+    // El bot no confirmó el regreso a normal -> relanzarlo en modo normal
+    if (ctrl.pendingNormal) { ctrl.pendingNormal = false; ctrl.blocked = false; beginRun(o, ctrl, 'normal'); return; }
 
     // Un boost programado interrumpió este run -> arrancar el boost ahora
     if (ctrl.pendingBoost) { ctrl.pendingBoost = false; ctrl.blocked = false; beginRun(o, ctrl, 'boost', { lifeMs: ctrl.pendingLifeMs }); return; }
@@ -574,6 +610,7 @@ function restWaiting(o, ctrl, msg) {
 
 function endCycle(o, ctrl, status, msg) {
   if (msg) appendLog(ctrl.runId, msg);
+  clearAck(ctrl);
   if (ctrl.durationTimer) clearTimeout(ctrl.durationTimer);
   if (ctrl.pauseTimer) clearTimeout(ctrl.pauseTimer);
   if (ctrl.boostTimer) clearTimeout(ctrl.boostTimer);
@@ -590,11 +627,17 @@ function stopOrder(id) {
   const ctrl = cycles.get(o.id);
   if (!ctrl) return { ok: false, error: 'Esta orden no está en ejecución.' };
   ctrl.userStopped = true;
+  clearAck(ctrl);
   if (ctrl.pauseTimer) { clearTimeout(ctrl.pauseTimer); ctrl.pauseTimer = null; }
   if (ctrl.durationTimer) { clearTimeout(ctrl.durationTimer); ctrl.durationTimer = null; }
   if (ctrl.boostTimer) { clearTimeout(ctrl.boostTimer); ctrl.boostTimer = null; }
   if (ctrl.weeklyTimer) { clearTimeout(ctrl.weeklyTimer); ctrl.weeklyTimer = null; }
-  if (ctrl.child) { stopChild(ctrl); }                   // el exit handler llama endCycle
+  if (ctrl.child) {                                      // el exit handler llama endCycle
+    ctrl.phase = 'stopping';
+    appendLog(ctrl.runId, '⏹ Deteniendo…');
+    pushOrderUpdate(o); broadcastState();
+    stopChild(ctrl, { fast: true });
+  }
   else { endCycle(o, ctrl, 'stopped', '⏹ Detenido por el usuario.'); } // estaba en pausa/espera
   return { ok: true };
 }

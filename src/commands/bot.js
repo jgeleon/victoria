@@ -70,11 +70,11 @@ export async function botCommand(rawOptions) {
   // Cierre ordenado: esperar la petición en vuelo y persistir la última cookie antes de salir.
   // Llega por IPC ({type:'stop'}, funciona en Windows) o por SIGTERM (Linux/macOS).
   let closing = false;
-  const closeGracefully = async (reason) => {
+  const closeGracefully = async (reason, maxWaitMs = 5000) => {
     if (closing) return;
     closing = true;
     log(`🔒 Cerrando (${reason}): guardando la sesión antes de salir`);
-    await bot.shutdown();
+    await bot.shutdown(maxWaitMs);
     process.exit(143);
   };
   process.once('SIGTERM', () => closeGracefully('SIGTERM'));
@@ -82,10 +82,12 @@ export async function botCommand(rawOptions) {
   if (process.send) {
     process.on('message', (msg) => {
       if (!msg || typeof msg !== 'object') return;
-      if (msg.type === 'stop') { closeGracefully('orden del supervisor'); return; }
+      // fast: detenido por el usuario, no esperar más de 1 s a la petición en curso
+      if (msg.type === 'stop') { closeGracefully('orden del supervisor', msg.fast ? 1000 : 5000); return; }
       if (msg.type === 'mode' && msg.mode === 'idle') {
         idle = true;
         log('💤 En espera: sin consultas, la sesión queda abierta en memoria');
+        process.send({ type: 'mode-ack', mode: 'idle' });
         napper.wake();
         return;
       }
@@ -95,6 +97,8 @@ export async function botCommand(rawOptions) {
         if (Number.isFinite(d) && d > 0) delaySeconds = d;
         focusWindow = parseFocusWindow(msg.focusWindow);
         log(`${msg.mode === 'boost' ? '⚡ Modo BOOST' : '▶ Modo normal'} en el mismo proceso: delay ${delaySeconds}s${focusWindow ? `, ventana s${focusWindow.start}-${focusWindow.end - 1}` : ''} (sesión conservada)`);
+        // el supervisor comprueba que el modo se aplicó; si no llega, reinicia el proceso
+        process.send({ type: 'mode-ack', mode: msg.mode, delay: delaySeconds });
         napper.wake(); // aplicar el ritmo nuevo ya, sin esperar a que termine la pausa actual
       }
     });

@@ -281,7 +281,7 @@ function updateCountdowns(){ const now=Date.now(); document.querySelectorAll('.c
 setInterval(updateCountdowns,1000);
 function statusOf(o){ if(o.run && o.running) return o.run.status; if(!o.run) return 'stopped'; return o.run.status; }
 function boostWhen(o){ return o.boostAt ? 'en '+o.boostAt+' de cada hora' : 'cada '+(o.boostMinute||'?')+' min'; }
-const EST_LABEL={running:'En ejecución',paused:'Pausada',stopped:'Detenido',finished:'Finalizada',error:'Error',booked:'Reservada ✓',blocked:'Detenido por bloqueo',boost:'⚡ Boost',waiting:'Esperando boost',auth_error:'🔐 Credenciales / cuenta bloqueada',no_reschedules:'🚫 Sin reprogramaciones',verify:'⚠️ Verificar reserva'};
+const EST_LABEL={running:'En ejecución',paused:'Pausada',stopped:'Detenido',finished:'Finalizada',error:'Error',booked:'Reservada ✓',blocked:'Detenido por bloqueo',boost:'⚡ Boost',waiting:'Esperando boost',stopping:'Deteniendo…',auth_error:'🔐 Credenciales / cuenta bloqueada',no_reschedules:'🚫 Sin reprogramaciones',verify:'⚠️ Verificar reserva'};
 
 // ---------- render tabla ----------
 function render(){
