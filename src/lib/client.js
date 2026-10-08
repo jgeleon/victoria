@@ -440,7 +440,7 @@ export class VisaHttpClient {
         if (error?.name === 'AbortError' || error?.type === 'aborted') {
           throw new VisaClientError(`Request timed out after ${timeoutMs}ms`, 'ETRANSIENT', { cause: error });
         }
-        throw new VisaClientError(`Network request failed: ${error.message}`, 'ETRANSIENT', { cause: error });
+        throw new VisaClientError(`Network request failed [${describeNetworkError(error)}]: ${error.message}`, 'ETRANSIENT', { cause: error, netCode: error?.code });
       } finally {
         clearTimeout(timeout);
       }
@@ -634,4 +634,24 @@ export function parseRescheduleLimit(html) {
     t.match(/(\d+)\s+(?:attempts?|intentos?)\s+(?:remaining|restantes?)/i) ??
     t.match(/you have\s+(\d+)\s+(?:attempts?|reschedules?)\s+left/i);
   return { max: max ? Number(max[1]) : null, remaining: remaining ? Number(remaining[1]) : null };
+}
+
+// Con varias IPs por host (Node 20+), node-fetch deja "reason:" vacío y la causa real
+// queda solo en error.code. La traducimos para que el log diga qué pasó.
+const NETWORK_ERRORS = {
+  ECONNREFUSED: 'el portal rechazó la conexión (posible bloqueo de la IP)',
+  ETIMEDOUT: 'el portal no aceptó la conexión a tiempo (posible bloqueo de la IP)',
+  ECONNRESET: 'el portal cortó la conexión (posible bloqueo de la IP)',
+  EPIPE: 'el portal cortó la conexión mientras se enviaba',
+  ENOTFOUND: 'fallo de DNS: no se encontró el portal',
+  EAI_AGAIN: 'fallo temporal de DNS',
+  EHOSTUNREACH: 'sin ruta de red hacia el portal',
+  ENETUNREACH: 'sin conexión a internet',
+  ENETDOWN: 'sin conexión a internet',
+};
+export function describeNetworkError(error) {
+  const code = error?.code || error?.errno || error?.cause?.code || '';
+  if (NETWORK_ERRORS[code]) return `${code}: ${NETWORK_ERRORS[code]}`;
+  if (/socket hang up/i.test(error?.message || '')) return 'socket hang up: el portal cerró la conexión sin responder';
+  return code || 'sin código';
 }

@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { Response } from 'node-fetch';
-import { VisaHttpClient, parseRescheduleLimit } from '../src/lib/client.js';
+import { VisaHttpClient, parseRescheduleLimit, describeNetworkError } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
 import { createNapper, errorSpacingSeconds, focusDelaySeconds, parseFocusWindow } from '../src/commands/bot.js';
 
@@ -166,4 +166,13 @@ test('when every facility fails the poll is an error, not "no dates"', async () 
   const client = { checkAvailableDate: async () => { const e = new Error('Network request failed'); e.code = 'ETRANSIENT'; throw e; } };
   const bot = new Bot(cfg(), { client });
   await assert.rejects(() => bot.checkAvailableDates({}, '2027-06-01', null, null), { code: 'ETRANSIENT' });
+});
+
+test('network errors with an empty reason show their real cause', async () => {
+  assert.match(describeNetworkError({ code: 'ECONNREFUSED', message: 'request to x failed, reason: ' }), /ECONNREFUSED: el portal rechazó/);
+  assert.match(describeNetworkError({ code: 'ETIMEDOUT' }), /no aceptó la conexión a tiempo/);
+  assert.equal(describeNetworkError({}), 'sin código');
+  const mockFetch = async () => { const e = new Error('request to https://x failed, reason: '); e.code = 'ECONNREFUSED'; throw e; };
+  const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
+  await assert.rejects(() => client.checkAvailableDate({}, '123', '115'), (err) => err.code === 'ETRANSIENT' && /\[ECONNREFUSED: el portal rechazó la conexión/.test(err.message));
 });

@@ -364,6 +364,17 @@ function startBoostNow(o, ctrl, lifeMs) {
 
 function boostFocusWindow(o) { return o.boostFocus ? FOCUS_WINDOW_PE : ''; }
 
+// Con la ventana activada, un boost que arranca fuera de ella espera hasta su inicio: avisarlo.
+function logFocusWait(ctrl, focusWindow) {
+  const m = /^(\d+)-(\d+)$/.exec(focusWindow || '');
+  if (!m) return;
+  const start = Number(m[1]), end = Number(m[2]);
+  const sec = new Date().getSeconds();
+  if (sec >= start && sec < end) return;
+  const wait = sec < start ? start - sec : 60 - sec + start;
+  appendLog(ctrl.runId, `🎯 El boost empezó en el segundo :${String(sec).padStart(2, '0')}, fuera de la ventana (s${start}–${end - 1}): consultará desde el segundo :${start} (en ${wait} s). Para no esperar, programa el boost en mm:${start}.`);
+}
+
 // Fin del ciclo normal: el proceso NO se cierra. Queda dormido con la sesión en memoria y el
 // próximo ciclo o boost lo despierta sin login. Mismas reglas que cuando el proceso salía.
 function normalCycleDone(o, ctrl) {
@@ -410,6 +421,7 @@ function switchToBoost(o, ctrl, lifeMs) {
   ctrl.mode = 'boost';
   ctrl.phase = 'boost';
   appendLog(ctrl.runId, `⚡ BOOST en el mismo proceso: la sesión se conserva (vida ${Math.round(life / 6000) / 10} min, delay ${ctrl.boostDelay}s${focusWindow ? `, ventana s${focusWindow}` : ''}).`);
+  logFocusWait(ctrl, focusWindow);
   ctrl.durationTimer = setTimeout(() => endBoostInPlace(o, ctrl), life);
   sendMode(o, ctrl, { mode: 'boost', delay: ctrl.boostDelay, focusWindow }, () => {
     // el bot no aplicó el boost: relanzarlo ya en modo boost (nace con el delay del boost)
@@ -510,6 +522,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
   ctrl.cycleStart = Date.now();
   ctrl.reviveAt = 0;
   appendLog(ctrl.runId, `$ ${command}`);
+  if (isBoost) logFocusWait(ctrl, focusWindow);
   if (isBoost) appendLog(ctrl.runId, `⚡ BOOST iniciado (vida ${Math.round(durationMs / 6000) / 10} min, delay ${delay}s${focusWindow ? `, ventana s${focusWindow}` : ''}).`);
   else appendLog(ctrl.runId, `▶ Ciclo iniciado${durationMs > 0 ? ` (dura ${o.durationMin} min)` : ''}`);
   pushOrderUpdate(o); broadcastState();
