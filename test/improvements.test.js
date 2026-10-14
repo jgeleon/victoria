@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { Response } from 'node-fetch';
-import { VisaHttpClient, parseRescheduleLimit, describeNetworkError } from '../src/lib/client.js';
+import { VisaHttpClient, parseRescheduleLimit, describeNetworkError, parseCurrentAppointment } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
 import { createNapper, errorSpacingSeconds, focusDelaySeconds, parseFocusWindow } from '../src/commands/bot.js';
 
@@ -14,14 +14,18 @@ function response(body, options, url) {
   return r;
 }
 const cfg = (o = {}) => ({ countryCode: 'pe', email: 'a@b.com', password: 'x', scheduleId: '123', facilityId: '115', requestTimeoutMs: 1000, ...o });
+const groupsPage = (date = '10 November, 2026', time = '09:00') =>
+  `<a href='/en-pe/niv/schedule/123/continue_actions'>Continue</a><p class='consular-appt'><strong>Consular Appointment:</strong> ${date}, ${time} Lima Local Time at Lima</p>`;
+const INSTRUCTIONS = 'https://ais.usvisa-info.com/en-pe/niv/schedule/123/appointment/instructions';
 const FORM = '<html><head><meta name="csrf-token" content="meta"></head><body><form><input name="authenticity_token" value="fresh"><select name="appointments[consulate_appointment][date]"></select></form></body></html>';
 
 // ---------- reserva ----------
 test('booking POST sends commit and no empty CAS fields', async () => {
   let body;
   const mockFetch = async (url, opts) => {
+    if (opts?.method !== 'POST') return response(groupsPage(), { status: 200 }, String(url));
     body = new URLSearchParams(opts.body.toString());
-    return response('ok', { status: 200 }, 'https://ais.usvisa-info.com/en-pe/niv/schedule/123/appointment/instructions');
+    return response('ok', { status: 200 }, INSTRUCTIONS);
   };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   client.csrfToken = 'tok';
@@ -31,25 +35,27 @@ test('booking POST sends commit and no empty CAS fields', async () => {
   assert.equal(body.get('authenticity_token'), 'tok');
 });
 
-test('redirect to /instructions counts as success', () => {
+test('booking responses are classified without trusting loose text', () => {
   const client = new VisaHttpClient('pe', 'a@b.com', 'x');
-  assert.equal(client._classifyBooking('https://x/en-pe/niv/schedule/1/appointment/instructions', '<p>?</p>', '2026-11-10', '09:00'), 'ok');
-  assert.equal(client._classifyBooking('https://x/es-pe/niv/schedule/1/appointment', '<p>Usted ha programado exitosamente su cita</p>', '2026-11-10', '09:00'), 'ok');
-  assert.equal(client._classifyBooking('https://x/es-pe/niv/schedule/1/appointment', '<p>La fecha ya no está disponible</p>', '2026-11-10', '09:00'), 'slot');
-  assert.equal(client._classifyBooking('https://x/en-pe/niv/schedule/1/appointment', FORM, '2026-11-10', '09:00'), 'form');
-  assert.equal(client._classifyBooking('https://x/en-pe/niv/schedule/1/appointment', '<p>algo raro</p>', '2026-11-10', '09:00'), 'unknown');
+  assert.equal(client._classifyBooking(INSTRUCTIONS, '<p>?</p>'), 'ok');
+  assert.equal(client._classifyBooking('https://x/es-pe/niv/schedule/1/appointment', '<p>Usted ha programado exitosamente su cita</p>'), 'claimed');
+  assert.equal(client._classifyBooking('https://x/es-pe/niv/schedule/1/appointment', '<p>La fecha ya no está disponible</p>'), 'slot');
+  assert.equal(client._classifyBooking('https://x/en-pe/niv/schedule/1/appointment', FORM), 'form');
+  // caso Carol: una página que solo menciona la fecha y la hora intentadas NO es una reserva
+  assert.equal(client._classifyBooking('https://x/en-pe/niv/schedule/1/appointment', '<p>2026-11-13 10:15</p>'), 'unknown');
 });
 
 test('unrecognized booking response never sends a second POST', async () => {
-  const methods = [];
+  const calls = [];
   const mockFetch = async (url, opts) => {
-    methods.push(opts?.method || 'GET');
-    return response('<p>respuesta desconocida</p>', { status: 200 }, String(url));
+    calls.push(opts?.method || 'GET');
+    if (opts?.method === 'POST') return response('<p>respuesta desconocida</p>', { status: 200 }, String(url));
+    return response(groupsPage('20 May, 2027'), { status: 200 }, String(url));
   };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   client.csrfToken = 'tok';
   await assert.rejects(() => client.book({}, '123', '115', '2026-11-10', '09:00'), { code: 'EBOOKING_UNVERIFIED' });
-  assert.deepEqual(methods, ['POST']);
+  assert.equal(calls.filter(m => m === 'POST').length, 1);
 });
 
 test('CSRF 422 on the fast path retries with a fresh token from the form', async () => {
@@ -58,13 +64,14 @@ test('CSRF 422 on the fast path retries with a fresh token from the form', async
     const method = opts?.method || 'GET';
     calls.push(`${method} ${new URL(url).search}`);
     if (method === 'POST' && calls.length === 1) return response('bad token', { status: 422 }, String(url));
+    if (method === 'GET' && url.includes('/account')) return response(groupsPage(), { status: 200 }, String(url));
     if (method === 'GET') return response(FORM, { status: 200 }, String(url));
-    return response('ok', { status: 200 }, 'https://ais.usvisa-info.com/en-pe/niv/schedule/123/appointment/instructions');
+    return response('ok', { status: 200 }, INSTRUCTIONS);
   };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   client.csrfToken = 'stale';
   await client.book({}, '123', '115', '2026-11-10', '09:00');
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4); // POST(422) + GET formulario + POST + GET Grupos
   assert.match(calls[1], /^GET \?confirmed_limit_message=1&commit=Continue$/);
   assert.equal(client.csrfToken, 'fresh');
 });
@@ -175,4 +182,46 @@ test('network errors with an empty reason show their real cause', async () => {
   const mockFetch = async () => { const e = new Error('request to https://x failed, reason: '); e.code = 'ECONNREFUSED'; throw e; };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   await assert.rejects(() => client.checkAvailableDate({}, '123', '115'), (err) => err.code === 'ETRANSIENT' && /\[ECONNREFUSED: el portal rechazó la conexión/.test(err.message));
+});
+
+// ---------- confirmación de la reserva en la página de Grupos ----------
+test('Carol case: the portal answers with the form and the appointment did not change -> never "booked"', async () => {
+  const posts = [];
+  const mockFetch = async (url, opts) => {
+    if (opts?.method === 'POST') { posts.push(1); return response(FORM + '<p>2026-11-13 10:15</p>', { status: 200 }, String(url)); }
+    if (url.includes('/account')) return response(groupsPage('20 May, 2027'), { status: 200 }, String(url));
+    return response(FORM, { status: 200 }, String(url));
+  };
+  const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
+  client.csrfToken = 'tok';
+  await assert.rejects(() => client.book({}, '123', '115', '2026-11-13', '10:15'), { code: 'EFORM_REJECTED' });
+  assert.equal(posts.length, 1); // formulario devuelto y la cita no cambió: rechazado, sin reintentar el POST
+});
+
+test('a redirect to /instructions that the groups page does not confirm stops as unverified', async () => {
+  const mockFetch = async (url, opts) => {
+    if (opts?.method === 'POST') return response('ok', { status: 200 }, INSTRUCTIONS);
+    return response(groupsPage('20 May, 2027'), { status: 200 }, String(url));
+  };
+  const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
+  client.csrfToken = 'tok';
+  await assert.rejects(() => client.book({}, '123', '115', '2026-11-13', '10:15'), { code: 'EBOOKING_UNVERIFIED' });
+});
+
+test('current appointment is read from the groups page (en / es, several groups)', () => {
+  assert.deepEqual(parseCurrentAppointment(groupsPage('20 May, 2027', '09:00'), '123'), { date: '2027-05-20', time: '09:00' });
+  const es = "<a href='/es-pe/niv/schedule/123/continue_actions'>Continuar</a><p class='consular-appt'><strong>Cita Consular:</strong> 20 mayo, 2027, 09:00 Lima Hora Local at Lima</p>";
+  assert.deepEqual(parseCurrentAppointment(es, '123'), { date: '2027-05-20', time: '09:00' });
+  const two = "<a href='/x/schedule/111/continue_actions'></a><p class='consular-appt'><strong>Consular Appointment:</strong> 1 March, 2027, 08:00</p>" +
+              "<a href='/x/schedule/123/continue_actions'></a><p class='consular-appt'><strong>Consular Appointment:</strong> 7 June, 2027, 10:30</p>";
+  assert.deepEqual(parseCurrentAppointment(two, '123'), { date: '2027-06-07', time: '10:30' });
+  assert.equal(parseCurrentAppointment('<p>sin cita</p>', '123'), null);
+});
+
+test('when the order and the portal disagree, the earliest current date is used', async () => {
+  const client = { checkAvailableDate: async () => ['2026-11-13', '2027-01-10', '2027-03-01'] };
+  const bot = new Bot(cfg(), { client });
+  bot.portalCurrentDate = '2027-01-31';
+  const dates = await bot.checkAvailableDates({}, '2027-05-20', null, null);
+  assert.deepEqual(dates.map(d => d.date), ['2026-11-13', '2027-01-10']);
 });

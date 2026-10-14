@@ -26,6 +26,8 @@ export class Bot {
     this._authenticated = false; // solo se persisten cookies de una sesión ya autenticada
     this._reuseTried = false;    // la sesión en disco se intenta solo en el primer initialize del proceso
     this.reusedSession = false;  // la sesión actual vino de disco y aún no se validó con una consulta
+    this.portalCurrentDate = null; // cita actual real según el portal (página de Grupos)
+    this._warnedMismatch = false;
     this.minDaysFromToday = Number(this.config.minDaysFromToday) || 0;
     this.dateFailuresFile = options.dateFailuresFile || this.config.dateFailuresFile || null;
     this.dateFailures = this._loadDateFailures();
@@ -55,6 +57,7 @@ export class Bot {
     await this.client.verifyAccountContext(this.config.scheduleId);
     log('Authenticated schedule verified');
     this._authenticated = true;
+    await this._readPortalAppointment();
     this.saveSession(true);
     this._logRescheduleLimit();
     this._assertRescheduleLeft();
@@ -65,6 +68,34 @@ export class Bot {
   describeRejectedSession(error) {
     const trace = (this.client.lastTrace || []).join(' | ') || 'sin traza';
     return `${error.message} · traza: ${trace}`;
+  }
+
+  async _readPortalAppointment() {
+    try {
+      const appt = await this.client.getCurrentAppointment(this.config.scheduleId, { html: this.client.lastGroupsHtml });
+      if (appt) {
+        this.portalCurrentDate = appt.date;
+        this._warnedMismatch = false;
+        log(`📅 Cita actual según el portal: ${appt.date} ${appt.time}`);
+      } else {
+        log('📅 No encontré la cita actual en la página de Grupos del portal');
+      }
+    } catch (err) {
+      log(`📅 No pude leer la cita actual del portal: ${err.message}`);
+    }
+  }
+
+  // Nunca mover la cita a una fecha igual o posterior a la real: si la orden y el portal no
+  // coinciden, manda la más temprana.
+  _effectiveCurrentDate(orderDate) {
+    const portal = this.portalCurrentDate;
+    if (!portal) return orderDate;
+    if (!orderDate) return portal;
+    if (portal !== orderDate && !this._warnedMismatch) {
+      this._warnedMismatch = true;
+      log(`⚠️ La fecha actual de la orden (${orderDate}) no coincide con la del portal (${portal}). Uso la más temprana para no empeorar la cita. Corrige la orden.`);
+    }
+    return portal < orderDate ? portal : orderDate;
   }
 
   _logRescheduleLimit() {
@@ -89,6 +120,7 @@ export class Bot {
       if (age > 30 * 60 * 1000) { log(`Sesión guardada descartada: tiene ${Math.round(age / 60000)} min (máx. 30)`); return null; }
       if (!this.client.importSession(data)) return null;
       this.client.rescheduleLimit = data.rescheduleLimit || null;
+      this.portalCurrentDate = data.portalCurrentDate || null;
       return age;
     } catch {
       return null;
@@ -115,6 +147,7 @@ export class Bot {
       const data = this.client.exportSession();
       data.email = this.config.email;
       data.rescheduleLimit = this.client.rescheduleLimit || null;
+      data.portalCurrentDate = this.portalCurrentDate || null;
       data.savedAt = now;
       fs.mkdirSync(path.dirname(this.sessionFile), { recursive: true });
       fs.writeFileSync(this.sessionFile, JSON.stringify(data));
@@ -136,7 +169,8 @@ export class Bot {
     }
     const now = Date.now();
     const maxKey = maxDate ? dateKey(maxDate) : null;
-    const currentKey = currentBookedDate ? dateKey(currentBookedDate) : null;
+    const effectiveCurrent = this._effectiveCurrentDate(currentBookedDate);
+    const currentKey = effectiveCurrent ? dateKey(effectiveCurrent) : null;
 
     const candidates = [];
     let lastError = null;
@@ -239,10 +273,16 @@ export class Bot {
           );
 
           this.bookedDates.add(bookedKey);
+          this.portalCurrentDate = date;
           log(`booked time at ${date} ${time}`);
           return { booked: true, time };
         } catch (err) {
           log(`failed to book ${date} ${time}: ${err.message}`);
+          if (err.code === 'EFORM_REJECTED') {
+            // El portal rechazó el envío: no insistir con esta fecha en esta consulta
+            this._recordDateFailure(facilityId, date);
+            return null;
+          }
           if (err.code !== 'ESLOT_UNAVAILABLE') throw err;
         }
       }

@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import fetch from 'node-fetch';
 import https from 'https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
@@ -165,7 +167,24 @@ export class VisaHttpClient {
     }
 
     this.csrfToken = this._findCsrfToken(loginHtml) || csrfToken;
+    this.lastGroupsHtml = loginHtml; // tras el login el portal muestra Grupos, con la cita actual
     return this._sessionHeaders();
+  }
+
+  // Cita consular actual según la página de Grupos del portal: { date, time } o null.
+  // Con html se usa esa página (la del login) y no se hace otra petición.
+  async getCurrentAppointment(scheduleId, { html } = {}) {
+    if (!html) {
+      const response = await this._request(`${this.baseUri}/account`, {
+        headers: { Accept: 'text/html,application/xhtml+xml' },
+        timeoutMs: TIMEOUT_PAGE_MS
+      });
+      html = await response.text();
+      if (this._isSignInPage(response.url, html)) {
+        throw new VisaClientError('Session expired while reading the current appointment', 'EAUTH');
+      }
+    }
+    return parseCurrentAppointment(html, scheduleId);
   }
 
   async verifyAccountContext(scheduleId) {
@@ -244,14 +263,19 @@ export class VisaHttpClient {
         log('Token CSRF rechazado (422); pidiendo el formulario para un token fresco');
       }
       if (fast) {
-        const outcome = this._classifyBooking(fast.response.url, fast.body, date, time);
-        if (outcome === 'ok') return fast.response;
+        const outcome = this._classifyBooking(fast.response.url, fast.body);
+        this._logBookingEvidence(fast.response, fast.body, outcome);
         if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
-        if (outcome === 'unknown') {
+        if (outcome !== 'auth') {
+          // Pase lo que pase, la verdad está en la página de Grupos
+          if (await this._confirmBooked(scheduleId, date, time, outcome)) return fast.response;
+          // El portal devolvió el formulario y la cita no cambió: rechazó el envío. Reintentar ya
+          // con otro token daría lo mismo y solo agrega POSTs.
+          if (outcome === 'form') throw new VisaClientError('The portal rejected the booking and re-rendered the form', 'EFORM_REJECTED');
           // No sabemos si reservó: un segundo POST podría gastar otra reprogramación (en Perú son limitadas)
-          throw new VisaClientError('Booking response could not be classified; stopping to avoid a duplicate reschedule', 'EBOOKING_UNVERIFIED');
+          throw new VisaClientError(`Booking not confirmed by the portal (respuesta: ${outcome}); stopping to avoid a duplicate reschedule`, 'EBOOKING_UNVERIFIED');
         }
-        // 'auth' / 'form' -> el portal no procesó la reserva; reintenta con token fresco
+        // 'auth' -> no se procesó; reintenta con token fresco
       }
     }
 
@@ -267,17 +291,53 @@ export class VisaHttpClient {
     this.csrfToken = this._findAuthenticityToken(appointmentHtml) || this._extractCsrfToken(appointmentHtml, appointmentResponse.url);
 
     const { response, body } = await this._postBooking(url, formUrl, this._buildBookingData(this.csrfToken, facilityId, date, time));
-    const outcome = this._classifyBooking(response.url, body, date, time);
-    if (outcome === 'ok') return response;
+    const outcome = this._classifyBooking(response.url, body);
+    this._logBookingEvidence(response, body, outcome);
     if (outcome === 'auth') throw new VisaClientError('Session expired while booking', 'EAUTH');
     if (outcome === 'slot') throw new VisaClientError('Booking failed; the slot became unavailable', 'ESLOT_UNAVAILABLE');
-    if (outcome === 'form') throw new VisaClientError('Booking failed; the portal re-rendered the appointment form', 'ESLOT_UNAVAILABLE');
+    if (await this._confirmBooked(scheduleId, date, time, outcome)) return response;
+    if (outcome === 'form') throw new VisaClientError('The portal rejected the booking and re-rendered the form', 'EFORM_REJECTED');
+    throw new VisaClientError(`Booking not confirmed by the portal (respuesta: ${outcome}); stopping to avoid a duplicate reschedule`, 'EBOOKING_UNVERIFIED');
+  }
 
-    const verified = await this._verifyBookedDate(scheduleId, date, time);
-    if (!verified) {
-      throw new VisaClientError('Booking response could not be verified; stopping to avoid a duplicate reschedule', 'EBOOKING_UNVERIFIED');
+  // Única prueba de reserva: la página de Grupos muestra la fecha nueva como cita actual.
+  // El portal puede tardar en reflejarla tras /instructions: se reintenta una vez.
+  async _confirmBooked(scheduleId, date, time, outcome) {
+    const attempts = outcome === 'ok' || outcome === 'claimed' ? [0, 3000] : [0];
+    let seen = null;
+    for (const wait of attempts) {
+      if (wait) await new Promise(r => setTimeout(r, wait));
+      try {
+        seen = await this.getCurrentAppointment(scheduleId);
+      } catch (err) {
+        log(`No pude leer la cita actual para confirmar la reserva: ${err.message}`);
+        continue;
+      }
+      if (seen && seen.date === date) {
+        log(`✅ Reserva confirmada en el portal: cita actual ${seen.date} ${seen.time}`);
+        return true;
+      }
     }
-    return response;
+    log(`❌ El portal NO muestra la reserva: cita actual ${seen ? `${seen.date} ${seen.time}` : 'no encontrada'} (se intentó ${date} ${time})`);
+    return false;
+  }
+
+  // Deja constancia de lo que respondió el portal (log + HTML completo si hay carpeta de diagnóstico)
+  _logBookingEvidence(response, body, outcome) {
+    try {
+      const $ = cheerio.load(body);
+      const title = $('title').first().text().trim().replace(/\s+/g, ' ').slice(0, 80);
+      const message = $('.alert, .flash, #flash_messages, .error, .errors, .notice, [role="alert"]')
+        .map((_, el) => $(el).text().trim().replace(/\s+/g, ' ')).get().filter(Boolean).join(' | ').slice(0, 300);
+      log(`🧾 Respuesta del portal a la reserva: HTTP ${response.status} · ${new URL(response.url).pathname} · título "${title}"${message ? ` · mensaje "${message}"` : ''} · clasificada como ${outcome}`);
+      const dir = process.env.BOOKING_DEBUG_DIR;
+      if (dir) {
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.html`);
+        fs.writeFileSync(file, `<!-- ${response.status} ${response.url} -->\n${body}`);
+        log(`🧾 HTML de la respuesta guardado en ${file}`);
+      }
+    } catch { /* el diagnóstico nunca debe romper la reserva */ }
   }
 
   _buildBookingData(csrfToken, facilityId, date, time) {
@@ -321,21 +381,21 @@ export class VisaHttpClient {
     return { response, body };
   }
 
-  // Clasifica la respuesta de reserva sin lanzar:
-  //   'ok'      reservó (redirección a /instructions o texto de éxito)
+  // Clasifica la respuesta de reserva sin lanzar. Ninguna clasificación prueba la reserva por sí
+  // sola: 'ok', 'claimed', 'form' y 'unknown' se confirman siempre en la página de Grupos.
+  //   'ok'      redirección a /instructions (señal oficial de éxito del portal)
+  //   'claimed' el texto dice éxito pero sin /instructions
   //   'slot'    el portal dijo que el cupo ya no está
   //   'auth'    sesión caída (no procesó)
-  //   'form'    volvió el formulario de cita sin éxito (no procesó)
-  //   'unknown' no se reconoce: NO se debe repetir el POST
-  _classifyBooking(url, body, date, time) {
+  //   'form'    volvió el formulario de cita (normalmente no procesó)
+  //   'unknown' no se reconoce
+  _classifyBooking(url, body) {
     if (/\/appointment\/instructions/.test(String(url))) return 'ok';
     if (this._isSignInPage(url, body)) return 'auth';
     const normalized = cheerio.load(body)('body').text().toLowerCase();
     if (BOOKING_FAILURES.some(m => normalized.includes(m))) return 'slot';
-    const positive = BOOKING_SUCCESS.some(m => normalized.includes(m)) ||
-      (normalized.includes(date.toLowerCase()) && normalized.includes(time.toLowerCase()));
-    if (positive) return 'ok';
     if (String(body).includes('appointments[consulate_appointment][date]')) return 'form';
+    if (BOOKING_SUCCESS.some(m => normalized.includes(m))) return 'claimed';
     return 'unknown';
   }
 
@@ -550,18 +610,6 @@ export class VisaHttpClient {
     }
   }
 
-  async _verifyBookedDate(scheduleId, date, time) {
-    const response = await this._request(this._appointmentFormUrl(scheduleId), {
-      headers: { Accept: 'text/html,application/xhtml+xml' },
-      timeoutMs: TIMEOUT_PAGE_MS
-    });
-    const html = (await response.text()).toLowerCase();
-    const text = cheerio.load(html)('body').text().toLowerCase();
-    const dateForms = [date.toLowerCase(), ...humanDates(date, this.lang)];
-    const hasDate = dateForms.some(d => html.includes(d) || text.includes(d));
-    return hasDate && (html.includes(time.toLowerCase()) || text.includes(time.toLowerCase()));
-  }
-
   _retryAfterSeconds(response) {
     const value = response.headers.get('retry-after');
     if (!value) return 60;
@@ -599,7 +647,7 @@ const BOOKING_FAILURES = [
   'no está disponible', 'ya no está disponible', 'no esta disponible', 'intente de nuevo', 'inténtelo de nuevo', 'no se pudo'
 ];
 const BOOKING_SUCCESS = [
-  'successfully', 'appointment confirmation', 'programado exitosamente', 'programó exitosamente', 'reprogramado exitosamente'
+  'successfully scheduled', 'successfully rescheduled', 'programado exitosamente', 'programó exitosamente', 'reprogramado exitosamente'
 ];
 
 const MONTHS = {
@@ -654,4 +702,34 @@ export function describeNetworkError(error) {
   if (NETWORK_ERRORS[code]) return `${code}: ${NETWORK_ERRORS[code]}`;
   if (/socket hang up/i.test(error?.message || '')) return 'socket hang up: el portal cerró la conexión sin responder';
   return code || 'sin código';
+}
+
+const MONTH_NUMBERS = {};
+for (const lang of Object.keys(MONTHS)) MONTHS[lang].forEach((m, i) => { MONTH_NUMBERS[m] = String(i + 1).padStart(2, '0'); });
+
+/**
+ * Cita consular actual de un grupo, leída de la página de Grupos:
+ *   <p class='consular-appt'><strong>Consular Appointment:</strong> 20 May, 2027, 09:00 Lima Local Time at Lima</p>
+ * Con varios grupos se toma la sección del scheduleId (desde su primer enlace hasta el del siguiente grupo).
+ */
+export function parseCurrentAppointment(html, scheduleId) {
+  let section = String(html || '');
+  const archived = section.search(/archived\s*groups|grupos archivados/i);
+  if (archived > -1) section = section.slice(0, archived);
+  if (scheduleId) {
+    const links = [...section.matchAll(/\/schedule\/(\d+)\//g)];
+    const firstOwn = links.find(m => m[1] === String(scheduleId));
+    if (firstOwn) {
+      const next = links.find(m => m.index > firstOwn.index && m[1] !== String(scheduleId));
+      section = section.slice(firstOwn.index, next ? next.index : undefined);
+    }
+  }
+  const block = /<p[^>]*class=['"][^'"]*consular-appt[^'"]*['"][^>]*>([\s\S]*?)<\/p>/i.exec(section);
+  if (!block) return null;
+  const text = block[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+  const m = /(\d{1,2})\s+(?:de\s+)?([a-záéíóúñ]+),?\s+(?:de\s+)?(\d{4}),?\s*(\d{1,2}:\d{2})/i.exec(text);
+  if (!m) return null;
+  const month = MONTH_NUMBERS[m[2].toLowerCase()];
+  if (!month) return null;
+  return { date: `${m[3]}-${month}-${m[1].padStart(2, '0')}`, time: m[4].padStart(5, '0') };
 }

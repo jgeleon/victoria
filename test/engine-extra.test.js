@@ -51,12 +51,16 @@ test('slot race: refetches times once and books on retry', async () => {
 
 test('fast booking reuses cached CSRF without a pre-GET', async () => {
   const requests = [];
+  const groups = "<a href='/en-pe/niv/schedule/123/continue_actions'>Continue</a><p class='consular-appt'><strong>Consular Appointment:</strong> 10 May, 2026, 09:00 Lima Local Time at Lima</p>";
   const mockFetch = async (url, opts) => {
-    requests.push((opts && opts.method) || 'GET');
-    return response('<html><body>Your appointment has been successfully booked.</body></html>', { status: 200 }, String(url));
+    const method = (opts && opts.method) || 'GET';
+    requests.push(`${method} ${new URL(url).pathname.split('/').pop()}`);
+    if (method === 'POST') return response('ok', { status: 200 }, 'https://ais.usvisa-info.com/en-pe/niv/schedule/123/appointment/instructions');
+    return response(groups, { status: 200 }, String(url));
   };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
   client.csrfToken = 'cached-token';
   await client.book({}, '123', '115', '2026-05-10', '09:00');
-  assert.deepEqual(requests, ['POST']); // solo POST, sin GET previo
+  // POST sin GET previo al formulario; el único GET es la confirmación en Grupos
+  assert.deepEqual(requests, ['POST appointment', 'GET account']);
 });
