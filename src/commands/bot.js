@@ -10,6 +10,15 @@ const JITTER_FACTOR = 0.2;
 // Dormido: sin peticiones, sesión en memoria. Cada tanto una consulta para que no caduque.
 const IDLE_KEEPALIVE_SECONDS = 10 * 60;
 
+// Portal saturado (5xx o lento): no es un bloqueo. Se sigue buscando con reintentos cortos y
+// solo se frena si la saturación se prolonga.
+export function saturationDelaySeconds(count) {
+  if (count <= 10) return 1 + Math.random();
+  if (count <= 30) return 3;
+  return 10;
+}
+const OFFLINE_RETRY_SECONDS = 10;
+
 // Con errores seguidos se espacian los intentos: insistir contra un bloqueo lo alarga.
 // Se vuelve al ritmo normal con el primer sondeo exitoso.
 export function errorSpacingSeconds(streak) {
@@ -154,6 +163,13 @@ export async function botCommand(rawOptions) {
   if (focusWindow) log(`🎯 Consultas concentradas en los segundos ${focusWindow.start}-${focusWindow.end - 1} de cada minuto`);
 
   let errorStreak = 0;
+  // Contadores por tipo de fallo transitorio; vuelven a cero con la primera consulta exitosa
+  const transient = { saturation: 0, network: 0, offline: 0 };
+  const resetTransient = () => {
+    const total = transient.saturation + transient.network + transient.offline;
+    if (total > 0) log(`✅ Conexión con el portal recuperada (tras ${transient.saturation} de saturación, ${transient.network} de conexión y ${transient.offline} sin internet).`);
+    transient.saturation = transient.network = transient.offline = 0;
+  };
   const pause = async (delay, reason) => {
     const spacing = errorSpacingSeconds(errorStreak);
     if (spacing > delay) {
@@ -184,8 +200,6 @@ export async function botCommand(rawOptions) {
       await pause(delay, 'login');
       continue;
     }
-
-    let transientFailureCount = 0;
 
     while (true) {
       try {
@@ -219,9 +233,9 @@ export async function botCommand(rawOptions) {
           options.min,
           options.max
         );
-        transientFailureCount = 0;
         blockFailureCount = 0;
         errorStreak = 0;
+        resetTransient();
         bot.reusedSession = false;
         pollCount += 1;
         candidatesSeen += availableDates.length;
@@ -254,6 +268,31 @@ export async function botCommand(rawOptions) {
           break;
         }
         if (isPermanentError(error)) throw error;
+
+        if (error.code === 'ETRANSIENT') {
+          // Ninguno de estos casos es un problema de sesión: nunca re-login por ellos
+          const kind = error.kind || 'network';
+          if (kind === 'saturation') {
+            transient.saturation += 1;
+            const delay = Math.max(delaySeconds, saturationDelaySeconds(transient.saturation));
+            log(`🌊 Portal saturado (${error.status ? `HTTP ${error.status}` : 'respuesta lenta'}), no es bloqueo: sigo buscando, reintento en ${delay.toFixed(1)}s (#${transient.saturation}).`);
+            await sleep(delay);
+            continue;
+          }
+          if (kind === 'offline') {
+            transient.offline += 1;
+            log(`📡 Sin conexión a internet en esta máquina (${error.netCode || 'red'}): reintento en ${OFFLINE_RETRY_SECONDS}s (#${transient.offline}).`);
+            await sleep(OFFLINE_RETRY_SECONDS);
+            continue;
+          }
+          transient.network += 1;
+          errorStreak += 1;
+          const delay = backoffSeconds(TRANSIENT_BACKOFF_SECONDS, transient.network);
+          log(`🧱 Falla la conexión con el portal: ${error.message}. Reintento en ${delay}s sin re-login (#${transient.network}).`);
+          await pause(delay, 'posible bloqueo de la IP');
+          continue;
+        }
+
         errorStreak += 1;
 
         if (error.code === 'ERATELIMIT') {
@@ -271,15 +310,6 @@ export async function botCommand(rawOptions) {
           await notifier.notifyError('WAF/anti-bot challenge', delay);
           await pause(delay, 'WAF');
           break;
-        }
-
-        if (error.code === 'ETRANSIENT') {
-          transientFailureCount += 1;
-          const delay = backoffSeconds(TRANSIENT_BACKOFF_SECONDS, transientFailureCount);
-          log(`Transient visa-site failure: ${error.message}. Retrying in ${delay}s`);
-          if (transientFailureCount >= TRANSIENT_BACKOFF_SECONDS.length) break;
-          await pause(delay, 'error transitorio');
-          continue;
         }
 
         throw error;

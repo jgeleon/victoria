@@ -499,9 +499,9 @@ export class VisaHttpClient {
           continue;
         }
         if (error?.name === 'AbortError' || error?.type === 'aborted') {
-          throw new VisaClientError(`Request timed out after ${timeoutMs}ms`, 'ETRANSIENT', { cause: error });
+          throw new VisaClientError(`Request timed out after ${timeoutMs}ms`, 'ETRANSIENT', { cause: error, kind: 'saturation' });
         }
-        throw new VisaClientError(`Network request failed [${describeNetworkError(error)}]: ${error.message}`, 'ETRANSIENT', { cause: error, netCode: error?.code });
+        throw new VisaClientError(`Network request failed [${describeNetworkError(error)}]: ${error.message}`, 'ETRANSIENT', { cause: error, netCode: error?.code, kind: networkErrorKind(error) });
       } finally {
         clearTimeout(timeout);
       }
@@ -534,7 +534,7 @@ export class VisaHttpClient {
         });
       }
       if (TRANSIENT_STATUSES.has(response.status)) {
-        throw new VisaClientError(`Visa site returned HTTP ${response.status}`, 'ETRANSIENT', { status: response.status });
+        throw new VisaClientError(`Visa site returned HTTP ${response.status}`, 'ETRANSIENT', { status: response.status, kind: 'saturation' });
       }
       if (!response.ok) {
         throw new VisaClientError(`Visa site returned HTTP ${response.status}`, 'EHTTP', { status: response.status });
@@ -698,6 +698,16 @@ const NETWORK_ERRORS = {
   ENETUNREACH: 'sin conexión a internet',
   ENETDOWN: 'sin conexión a internet',
 };
+// Tipo de fallo transitorio, para reaccionar distinto:
+//   saturation  el portal responde mal o lento (5xx, timeout de respuesta): no es bloqueo
+//   offline     la red de esta máquina falla (DNS, sin ruta): no es culpa del portal
+//   network     la conexión con el portal se rechaza o se corta: posible bloqueo de la IP
+const OFFLINE_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN']);
+export function networkErrorKind(error) {
+  const code = error?.code || error?.errno || error?.cause?.code || '';
+  return OFFLINE_CODES.has(code) ? 'offline' : 'network';
+}
+
 export function describeNetworkError(error) {
   const code = error?.code || error?.errno || error?.cause?.code || '';
   if (NETWORK_ERRORS[code]) return `${code}: ${NETWORK_ERRORS[code]}`;

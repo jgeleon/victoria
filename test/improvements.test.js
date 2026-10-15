@@ -6,7 +6,7 @@ import path from 'path';
 import { Response } from 'node-fetch';
 import { VisaHttpClient, parseRescheduleLimit, describeNetworkError, parseCurrentAppointment } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
-import { createNapper, errorSpacingSeconds, focusDelaySeconds, gridDelaySeconds, parseFocusWindow, parsePhase } from '../src/commands/bot.js';
+import { createNapper, errorSpacingSeconds, focusDelaySeconds, gridDelaySeconds, parseFocusWindow, parsePhase, saturationDelaySeconds } from '../src/commands/bot.js';
 
 function response(body, options, url) {
   const r = new Response(body, options);
@@ -246,4 +246,19 @@ test('poll turns spread orders evenly across the period', () => {
   assert.equal(parsePhase('0.25'), 0.25);
   assert.equal(parsePhase('1'), null);
   assert.equal(parsePhase(''), null);
+});
+
+// ---------- saturación vs bloqueo ----------
+test('transient failures are classified as saturation, offline or network', async () => {
+  const fail = (makeError) => new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: async () => makeError() });
+  const kindOf = async (client) => { try { await client.checkAvailableDate({}, '123', '115'); } catch (e) { return `${e.code}/${e.kind}`; } };
+  assert.equal(await kindOf(fail(() => response('busy', { status: 503 }, 'https://x'))), 'ETRANSIENT/saturation');
+  assert.equal(await kindOf(fail(() => { const e = new Error('x'); e.code = 'ECONNREFUSED'; throw e; })), 'ETRANSIENT/network');
+  assert.equal(await kindOf(fail(() => { const e = new Error('x'); e.code = 'ENOTFOUND'; throw e; })), 'ETRANSIENT/offline');
+});
+
+test('saturation keeps searching with short retries and only slows down if it lasts', () => {
+  assert.ok(saturationDelaySeconds(1) >= 1 && saturationDelaySeconds(1) < 2);
+  assert.equal(saturationDelaySeconds(20), 3);
+  assert.equal(saturationDelaySeconds(50), 10);
 });
