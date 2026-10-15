@@ -89,6 +89,8 @@
   .ab.start{border-color:rgba(46,160,67,.5);color:var(--greenb)}
   .ab.start:hover{background:rgba(46,160,67,.15)}
   .ab.stop{border-color:rgba(229,83,75,.5);color:var(--red)}
+  .ab.boost{border-color:rgba(210,153,34,.55);color:var(--amber)}
+  .ab.boost:hover{background:rgba(210,153,34,.15)}
   .ab.stop:hover{background:rgba(229,83,75,.15)}
   .ab.del:hover{border-color:var(--red);color:var(--red)}
   .ab[disabled]{opacity:.35;cursor:not-allowed}
@@ -346,6 +348,8 @@ function render(){
       '<td><div class="acts">'+
         '<span class="ab view" data-viewlogs="'+o.id+'" data-run="'+runId+'" title="Ver logs">👁</span>'+
         '<span class="ab edit" data-edit="'+o.id+'" title="Editar"'+(o.running?' disabled':'')+'>✎</span>'+
+        (o.running && st!=='boost' && st!=='stopping'
+          ? '<span class="ab boost" data-boostnow="'+o.id+'" title="Boost ahora: consultar rápido en el mismo proceso, sin login">⚡</span>' : '')+
         (o.running
           ? '<span class="ab stop" data-stop="'+o.id+'" title="Detener">■</span>'
           : '<span class="ab start" data-start="'+o.id+'" title="Iniciar">▶</span>')+
@@ -359,6 +363,7 @@ function render(){
 function bindRowActions(){
   document.querySelectorAll('[data-start]').forEach(el=>el.onclick=()=>act('/api/start',{id:el.dataset.start}));
   document.querySelectorAll('[data-stop]').forEach(el=>el.onclick=()=>act('/api/stop',{id:el.dataset.stop}));
+  document.querySelectorAll('[data-boostnow]').forEach(el=>el.onclick=()=>act('/api/boost',{id:el.dataset.boostnow}));
   document.querySelectorAll('[data-edit]').forEach(el=>{if(el.hasAttribute('disabled'))return;el.onclick=()=>openEdit(el.dataset.edit);});
   document.querySelectorAll('[data-del]').forEach(el=>{if(el.hasAttribute('disabled'))return;el.onclick=()=>delOrder(el.dataset.del);});
   document.querySelectorAll('[data-viewlogs]').forEach(el=>el.onclick=()=>openLogs(el.dataset.viewlogs,el.dataset.run));

@@ -303,7 +303,7 @@ export async function botCommand(rawOptions) {
           transient.network += 1;
           errorStreak += 1;
           const delay = backoffSeconds(TRANSIENT_BACKOFF_SECONDS, transient.network);
-          log(`🧱 Falla la conexión con el portal: ${error.message}. Reintento en ${delay}s sin re-login (#${transient.network}).`);
+          log(`🧱 ${error.message}. Reintento en ${delay}s sin re-login (#${transient.network}).`);
           await pause(delay, 'posible bloqueo de la IP');
           continue;
         }

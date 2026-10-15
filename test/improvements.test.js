@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { Response } from 'node-fetch';
-import { VisaHttpClient, parseRescheduleLimit, describeNetworkError, parseCurrentAppointment } from '../src/lib/client.js';
+import { VisaHttpClient, parseRescheduleLimit, describeNetworkError, parseCurrentAppointment, shortPath } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
 import { createNapper, errorSpacingSeconds, focusDelaySeconds, gridDelaySeconds, parseFocusWindow, parsePhase, saturationDelaySeconds } from '../src/commands/bot.js';
 
@@ -181,7 +181,7 @@ test('network errors with an empty reason show their real cause', async () => {
   assert.equal(describeNetworkError({}), 'sin código');
   const mockFetch = async () => { const e = new Error('request to https://x failed, reason: '); e.code = 'ECONNREFUSED'; throw e; };
   const client = new VisaHttpClient('pe', 'a@b.com', 'x', { fetch: mockFetch });
-  await assert.rejects(() => client.checkAvailableDate({}, '123', '115'), (err) => err.code === 'ETRANSIENT' && /\[ECONNREFUSED: el portal rechazó la conexión/.test(err.message));
+  await assert.rejects(() => client.checkAvailableDate({}, '123', '115'), (err) => err.code === 'ETRANSIENT' && err.message === 'Fallo de red en days/115.json: ECONNREFUSED: el portal rechazó la conexión (posible bloqueo de la IP)');
 });
 
 // ---------- confirmación de la reserva en la página de Grupos ----------
@@ -284,4 +284,10 @@ test('an appointment already at the minimum limit cannot be improved', () => {
   assert.equal(bot.improvementImpossible(), null);
   bot.portalCurrentDate = '2026-11-25'; // el portal dice que ya está antes del mínimo
   assert.equal(bot.improvementImpossible().current, '2026-11-25');
+});
+
+test('error messages show only the resource, not the full URL', () => {
+  assert.equal(shortPath('https://ais.usvisa-info.com/en-pe/niv/schedule/75603633/appointment/days/115.json?appointments%5Bexpedite%5D=false'), 'days/115.json');
+  assert.equal(shortPath('https://ais.usvisa-info.com/en-pe/niv/schedule/1/appointment'), 'appointment');
+  assert.equal(shortPath('https://ais.usvisa-info.com/en-pe/niv/users/sign_in'), 'users/sign_in');
 });

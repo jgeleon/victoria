@@ -499,9 +499,9 @@ export class VisaHttpClient {
           continue;
         }
         if (error?.name === 'AbortError' || error?.type === 'aborted') {
-          throw new VisaClientError(`Request timed out after ${timeoutMs}ms`, 'ETRANSIENT', { cause: error, kind: 'saturation' });
+          throw new VisaClientError(`Sin respuesta del portal en ${Math.round(timeoutMs / 1000)}s (${shortPath(url)})`, 'ETRANSIENT', { cause: error, kind: 'saturation' });
         }
-        throw new VisaClientError(`Network request failed [${describeNetworkError(error)}]: ${error.message}`, 'ETRANSIENT', { cause: error, netCode: error?.code, kind: networkErrorKind(error) });
+        throw new VisaClientError(`Fallo de red en ${shortPath(url)}: ${describeNetworkError(error)}`, 'ETRANSIENT', { cause: error, netCode: error?.code, kind: networkErrorKind(error) });
       } finally {
         clearTimeout(timeout);
       }
@@ -534,7 +534,7 @@ export class VisaHttpClient {
         });
       }
       if (TRANSIENT_STATUSES.has(response.status)) {
-        throw new VisaClientError(`Visa site returned HTTP ${response.status}`, 'ETRANSIENT', { status: response.status, kind: 'saturation' });
+        throw new VisaClientError(`El portal respondió HTTP ${response.status} (${shortPath(url)})`, 'ETRANSIENT', { status: response.status, kind: 'saturation' });
       }
       if (!response.ok) {
         throw new VisaClientError(`Visa site returned HTTP ${response.status}`, 'EHTTP', { status: response.status });
@@ -698,6 +698,16 @@ const NETWORK_ERRORS = {
   ENETUNREACH: 'sin conexión a internet',
   ENETDOWN: 'sin conexión a internet',
 };
+// "https://…/en-pe/niv/schedule/123/appointment/days/115.json?…" -> "days/115.json"
+export function shortPath(url) {
+  try {
+    const p = new URL(url).pathname.replace(/^.*?\/niv\//, '').replace(/^schedule\/\d+\/appointment\/?/, '');
+    return p || 'appointment';
+  } catch {
+    return String(url).slice(0, 60);
+  }
+}
+
 // Tipo de fallo transitorio, para reaccionar distinto:
 //   saturation  el portal responde mal o lento (5xx, timeout de respuesta): no es bloqueo
 //   offline     la red de esta máquina falla (DNS, sin ruta): no es culpa del portal

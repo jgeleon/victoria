@@ -668,6 +668,21 @@ function endCycle(o, ctrl, status, msg) {
   pushOrderUpdate(o); broadcastState();
 }
 
+// Boost lanzado a mano desde el panel: mismo proceso, sin login. Usa la configuración de boost
+// de la orden; si no tiene, 1 minuto con su delay normal.
+const MANUAL_BOOST_DEFAULT_MS = 60000;
+function boostNow(id) {
+  const o = findOrder(id);
+  if (!o) return { ok: false, error: 'Orden no encontrada.' };
+  const ctrl = cycles.get(o.id);
+  if (!ctrl || ctrl.userStopped || ctrl.phase === 'stopping') return { ok: false, error: 'La orden no está en ejecución.' };
+  if (ctrl.mode === 'boost') return { ok: false, error: 'La orden ya está en boost.' };
+  const life = ctrl.boostLifeMs || MANUAL_BOOST_DEFAULT_MS;
+  appendLog(ctrl.runId, '⚡ Boost manual pedido desde el panel.');
+  startBoostNow(o, ctrl, life);
+  return { ok: true };
+}
+
 function stopOrder(id) {
   const o = findOrder(id);
   if (!o) return { ok: false, error: 'Orden no encontrada.' };
@@ -805,6 +820,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && p === '/api/start') { const b = await readBody(req); sendResult(res, startOrder(b.id)); return; }
   if (req.method === 'POST' && p === '/api/stop') { const b = await readBody(req); sendResult(res, stopOrder(b.id)); return; }
+  if (req.method === 'POST' && p === '/api/boost') { const b = await readBody(req); sendResult(res, boostNow(b.id)); return; }
 
   if (req.method === 'POST' && p === '/api/telegram/test') {
     const b = await readBody(req);
