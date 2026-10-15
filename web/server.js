@@ -212,7 +212,7 @@ function validateOrder(b, { partial = false } = {}) {
 }
 
 // ---------------- supervisor de ciclos ----------------
-function spawnChild(o, { refreshDelay, focusWindow } = {}) {
+function spawnChild(o, { refreshDelay, focusWindow, pollPhase = 0 } = {}) {
   const args = [INDEX_JS, '-c', o.current];
   if ((o.target || '').trim()) args.push('-t', o.target.trim());
   if ((o.min || '').trim()) args.push('-m', o.min.trim());
@@ -220,7 +220,7 @@ function spawnChild(o, { refreshDelay, focusWindow } = {}) {
   const delay = String(refreshDelay || o.refreshDelay || '3');
   const sessionFile = path.join(DATA_DIR, 'sessions', `${o.id}.json`);
   try { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); } catch { /* noop */ }
-  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), LOGIN_LOCK_DIR: path.join(DATA_DIR, 'locks'), DATE_FAILURES_FILE: path.join(DATA_DIR, 'datefail', `${o.id}.json`), BOOKING_DEBUG_DIR: path.join(DATA_DIR, 'booking-debug', o.id), FOCUS_WINDOW: focusWindow || '', GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
+  const env = { ...process.env, ...STATIC_ENV, EMAIL: o.email, PASSWORD: o.password, SCHEDULE_ID: o.scheduleId, REFRESH_DELAY: delay, SESSION_FILE: sessionFile, USE_PROXY: (o.useProxy === false ? 'false' : 'true'), FACILITY_IDS: (o.facilityIds || '').trim(), ONLY_BUSINESS_DAY: (o.onlyBusinessDay ? 'true' : 'false'), RATE_LIMIT_FILE: path.join(DATA_DIR, 'ratelimit.json'), LOGIN_LOCK_DIR: path.join(DATA_DIR, 'locks'), DATE_FAILURES_FILE: path.join(DATA_DIR, 'datefail', `${o.id}.json`), BOOKING_DEBUG_DIR: path.join(DATA_DIR, 'booking-debug', o.id), FOCUS_WINDOW: focusWindow || '', POLL_PHASE: String(pollPhase), GLOBAL_MAX_RPS: (process.env.GLOBAL_MAX_RPS || '12'), TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' };
   // 'ipc': canal para cambiar de modo (normal <-> boost) y pedir un cierre ordenado sin matar
   // el proceso. Funciona igual en Windows, donde SIGTERM mata de golpe.
   const cp = spawn(process.execPath, args, { cwd: PROJECT_ROOT, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
@@ -266,8 +266,34 @@ function sendMode(o, ctrl, msg, fallback) {
   }, MODE_ACK_MS);
   return true;
 }
-function onChildMessage(ctrl, m) {
+function onChildMessage(o, ctrl, m) {
   if (m && m.type === 'mode-ack' && m.mode === ctrl.awaitingAck) clearAck(ctrl);
+  if (m && m.type === 'dates' && Array.isArray(m.days)) shareDates(o, m);
+}
+
+// ---------------- flota: fechas compartidas y turnos ----------------
+// Lo que ve una orden se reenvía a las demás; cada una lo filtra con SUS parámetros y, si le
+// sirve, intenta reservar sin esperar su propia consulta. Solo se reenvía cuando cambia.
+const lastShared = new Map(); // facilityId -> lista de fechas ya reenviada
+function shareDates(from, m) {
+  const key = m.days.map(d => d && d.date).join(',');
+  if (lastShared.get(String(m.facilityId)) === key) return;
+  lastShared.set(String(m.facilityId), key);
+  for (const [id, c] of cycles) {
+    if (id === from.id || c.userStopped || c.booked) continue;
+    sendToChild(c, { type: 'dates', facilityId: m.facilityId, days: m.days, from: `La orden "${from.cliente}"` });
+  }
+}
+
+// Turno de cada orden dentro del periodo de consulta (0, 1/N, 2/N…): entre todas cubren el
+// minuto a intervalos parejos en vez de consultar todas en el mismo instante.
+function phaseFor(id) {
+  const ids = [...cycles.keys()].sort();
+  const i = ids.indexOf(id);
+  return i < 0 || ids.length < 2 ? 0 : i / ids.length;
+}
+function rebalancePhases() {
+  for (const [id, c] of cycles) sendToChild(c, { type: 'phase', fraction: phaseFor(id) });
 }
 
 // ms hasta el próximo disparo: cada 'step' minutos, alineado al reloj del servidor
@@ -505,6 +531,8 @@ function startOrder(id) {
   if (boostEnabled) scheduleBoost(o, ctrl);
   scheduleWeekly(o, ctrl);
   beginRun(o, ctrl, 'normal');
+  rebalancePhases();
+  if (cycles.size > 1) appendLog(runId, `🤝 Flota: ${cycles.size} órdenes en ejecución comparten las fechas que ve cada una; esta consulta en el turno ${[...cycles.keys()].sort().indexOf(o.id) + 1} de ${cycles.size}.`);
   pushOrderUpdate(o); broadcastState();
   return { ok: true, order: publicOrder(o) };
 }
@@ -516,7 +544,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
   const durationMs = isBoost ? (lifeMs || ctrl.boostLifeMs) : ctrl.normalDurationMs;
   const delay = isBoost ? ctrl.boostDelay : (o.refreshDelay || '3');
   const focusWindow = isBoost ? boostFocusWindow(o) : '';
-  const { cp, command } = spawnChild(o, { refreshDelay: delay, focusWindow });
+  const { cp, command } = spawnChild(o, { refreshDelay: delay, focusWindow, pollPhase: phaseFor(o.id) });
   ctrl.child = cp;
   ctrl.phase = isBoost ? 'boost' : 'running';
   ctrl.cycleStart = Date.now();
@@ -544,7 +572,7 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
     }
     if (isErr) errBuf = buf; else outBuf = buf;
   };
-  cp.on('message', (m) => onChildMessage(ctrl, m));
+  cp.on('message', (m) => onChildMessage(o, ctrl, m));
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
@@ -629,6 +657,7 @@ function endCycle(o, ctrl, status, msg) {
   if (ctrl.boostTimer) clearTimeout(ctrl.boostTimer);
   if (ctrl.weeklyTimer) clearTimeout(ctrl.weeklyTimer);
   cycles.delete(o.id);
+  rebalancePhases();
   if (o.run) { o.run.status = status; o.run.endedAt = Date.now(); }
   saveOrders();
   pushOrderUpdate(o); broadcastState();

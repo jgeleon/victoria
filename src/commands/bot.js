@@ -20,6 +20,23 @@ export function errorSpacingSeconds(streak) {
   return 600;
 }
 
+// Turno de la orden en la grilla de consultas: fracción del periodo en [0, 1).
+export function parsePhase(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const f = Number(value);
+  return Number.isFinite(f) && f >= 0 && f < 1 ? f : null;
+}
+
+// Segundos hasta el próximo turno de la grilla: instantes (k + fracción) * periodo. Con N órdenes
+// de igual periodo y fracciones 0, 1/N, 2/N…, entre todas consultan a intervalos parejos.
+export function gridDelaySeconds(periodSeconds, fraction, nowMs = Date.now()) {
+  const period = Math.max(50, periodSeconds * 1000);
+  const offset = fraction * period;
+  const next = Math.floor((nowMs - offset) / period + 1) * period + offset;
+  const jitter = Math.random() * 0.03 * period; // leve, para no ser un reloj perfecto
+  return Math.max(0.05, (next - nowMs + jitter) / 1000);
+}
+
 // Pausa entre consultas que se puede interrumpir (cambio de modo en caliente).
 export function createNapper() {
   let wakeUp = null;
@@ -66,6 +83,24 @@ export async function botCommand(rawOptions) {
   let focusWindow = parseFocusWindow(process.env.FOCUS_WINDOW);
   const napper = createNapper();
   let idle = false;
+  // Flota: fechas que vio otra orden (se procesan sin consultar al portal) y turno dentro de la
+  // grilla de consultas, para que entre todas las órdenes cubran el minuto sin chocar.
+  let sharedDates = null;
+  let phaseFraction = parsePhase(process.env.POLL_PHASE);
+  const napUntilNextTurn = async () => {
+    if (idle) return;
+    const base = phaseFraction !== null ? gridDelaySeconds(delaySeconds, phaseFraction) : jitterSeconds(delaySeconds);
+    await napper.nap(focusDelaySeconds(base, focusWindow));
+  };
+  if (process.send) {
+    let lastSharedKey = '';
+    bot.onDates = (facilityId, days) => {
+      const key = `${facilityId}:${days.map(d => d.date).join(',')}`;
+      if (key === lastSharedKey) return; // solo cuando cambian
+      lastSharedKey = key;
+      try { process.send({ type: 'dates', facilityId, days }); } catch { /* noop */ }
+    };
+  }
 
   // Cierre ordenado: esperar la petición en vuelo y persistir la última cookie antes de salir.
   // Llega por IPC ({type:'stop'}, funciona en Windows) o por SIGTERM (Linux/macOS).
@@ -83,6 +118,12 @@ export async function botCommand(rawOptions) {
     process.on('message', (msg) => {
       if (!msg || typeof msg !== 'object') return;
       // fast: detenido por el usuario, no esperar más de 1 s a la petición en curso
+      if (msg.type === 'dates' && Array.isArray(msg.days)) {
+        sharedDates = { facilityId: msg.facilityId, days: msg.days, from: msg.from || 'otra orden' };
+        napper.wake();
+        return;
+      }
+      if (msg.type === 'phase') { phaseFraction = parsePhase(msg.fraction); return; }
       if (msg.type === 'stop') { closeGracefully('orden del supervisor', msg.fast ? 1000 : 5000); return; }
       if (msg.type === 'mode' && msg.mode === 'idle') {
         idle = true;
@@ -148,11 +189,30 @@ export async function botCommand(rawOptions) {
 
     while (true) {
       try {
-        if (idle) {
+        if (idle && !sharedDates) {
           const woken = await napper.nap(IDLE_KEEPALIVE_SECONDS);
           if (idle && !woken) log('💤 Consulta de mantenimiento para que la sesión no caduque');
-          else if (idle) continue;
+          else if (idle && !sharedDates) continue;
         }
+
+        // Fechas que vio otra orden: si alguna le sirve a ESTA orden, ir directo a reservar
+        if (sharedDates) {
+          const shared = sharedDates;
+          sharedDates = null;
+          const mine = bot.filterSharedDates(shared.facilityId, shared.days, options.current, options.min, options.max);
+          if (mine.length) {
+            log(`🤝 ${shared.from} vio fechas que sirven a esta orden: ${mine.map(d => d.date).join(', ')}. Intento reservar sin esperar mi consulta.`);
+            const result = await bot.bookFirstAvailable(sessionHeaders, mine);
+            if (result) {
+              await notifier.notifyBooked(result.date, result.time, options.dryRun);
+              log(`Successfully ${options.dryRun ? 'found' : 'booked'} appointment on ${result.date} at ${result.time}${result.facilityId ? ` (facility ${result.facilityId})` : ''}`);
+              return;
+            }
+          }
+          await napUntilNextTurn(); // sin consulta extra: se vuelve a esperar el turno propio
+          continue;
+        }
+
         const availableDates = await bot.checkAvailableDates(
           sessionHeaders,
           options.current,
@@ -183,7 +243,7 @@ export async function botCommand(rawOptions) {
           return;
         }
 
-        if (!idle) await napper.nap(focusDelaySeconds(jitterSeconds(delaySeconds), focusWindow));
+        await napUntilNextTurn();
       } catch (error) {
         if (error.code === 'EAUTH') {
           if (bot.reusedSession) {

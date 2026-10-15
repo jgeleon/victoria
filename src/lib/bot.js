@@ -155,22 +155,8 @@ export class Bot {
   }
 
   async checkAvailableDates(sessionHeaders, currentBookedDate, minDate, maxDate) {
-    const facilityIds = (this.config.facilityIds && this.config.facilityIds.length)
-      ? this.config.facilityIds
-      : [this.config.facilityId];
-
-    let minKey = minDate ? dateKey(minDate) : null;
-    // Nunca reservar a menos de N días de hoy (fecha de Lima)
-    let floorDate = null;
-    if (this.minDaysFromToday > 0) {
-      floorDate = limaDate(Date.now() + this.minDaysFromToday * 86400000);
-      const floorKey = dateKey(floorDate);
-      if (minKey === null || floorKey > minKey) minKey = floorKey;
-    }
-    const now = Date.now();
-    const maxKey = maxDate ? dateKey(maxDate) : null;
-    const effectiveCurrent = this._effectiveCurrentDate(currentBookedDate);
-    const currentKey = effectiveCurrent ? dateKey(effectiveCurrent) : null;
+    const facilityIds = this._facilityIds();
+    const filter = this._dateFilter(currentBookedDate, minDate, maxDate);
 
     const candidates = [];
     let lastError = null;
@@ -193,21 +179,15 @@ export class Bot {
         continue;
       }
 
-      if (!dates || dates.length === 0) { log(`facility ${facilityId}: sin fechas`); continue; }
-
-      const rejected = { invalid: 0, beforeMin: 0, afterMax: 0, notEarlier: 0, ghost: 0 };
-      let good = 0;
-      for (const date of new Set(dates)) {
-        let key;
-        try { key = dateKey(date); } catch { rejected.invalid += 1; continue; }
-        if (minKey !== null && key < minKey) { rejected.beforeMin += 1; continue; }
-        if (maxKey !== null && key > maxKey) { rejected.afterMax += 1; continue; }
-        if (currentKey !== null && key >= currentKey) { rejected.notEarlier += 1; continue; }
-        if (this._ghostBlocked(facilityId, date, now)) { rejected.ghost += 1; continue; }
-        candidates.push({ date, facilityId, key });
-        good += 1;
+      // Lo que ve esta orden sirve a las demás (cada una lo vuelve a filtrar con lo suyo)
+      if (this.onDates && Array.isArray(this.client.lastDays)) {
+        try { this.onDates(facilityId, this.client.lastDays); } catch { /* noop */ }
       }
-      log(`facility ${facilityId}: ${good} fechas válidas de ${dates.length} (rechazadas=${JSON.stringify(rejected)}${floorDate ? `, piso=${floorDate}` : ''})`);
+
+      if (!dates || dates.length === 0) { log(`facility ${facilityId}: sin fechas`); continue; }
+      const { good, rejected } = this._filterFacilityDates(facilityId, dates, filter);
+      candidates.push(...good);
+      log(`facility ${facilityId}: ${good.length} fechas válidas de ${dates.length} (rechazadas=${JSON.stringify(rejected)}${filter.floorDate ? `, piso=${filter.floorDate}` : ''})`);
     }
 
     // Si ningún consulado respondió no es "sin fechas": es un fallo, y el bucle debe frenar
@@ -217,18 +197,59 @@ export class Bot {
       log('No qualifying dates across facilities');
       return [];
     }
-
-    candidates.sort((a, b) => a.key - b.key);
-    const seen = new Set();
-    const result = [];
-    for (const c of candidates) {
-      const k = `${c.facilityId}:${c.date}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      result.push({ date: c.date, facilityId: c.facilityId });
-    }
+    const result = rankCandidates(candidates);
     log(`Total ${result.length} fechas candidatas; más temprana: ${result[0].date} (facility ${result[0].facilityId})`);
     return result;
+  }
+
+  // Fechas que vio OTRA orden: se filtran con los parámetros de ESTA orden. Sin petición al portal.
+  filterSharedDates(facilityId, days, currentBookedDate, minDate, maxDate) {
+    if (!this._facilityIds().includes(String(facilityId)) || !Array.isArray(days)) return [];
+    const dates = days
+      .filter(d => d && typeof d.date === 'string')
+      .filter(d => !this.config.onlyBusinessDay || d.business_day !== false)
+      .map(d => d.date);
+    const { good } = this._filterFacilityDates(String(facilityId), dates, this._dateFilter(currentBookedDate, minDate, maxDate));
+    return good.length ? rankCandidates(good) : [];
+  }
+
+  _facilityIds() {
+    return ((this.config.facilityIds && this.config.facilityIds.length) ? this.config.facilityIds : [this.config.facilityId]).map(String);
+  }
+
+  // Reglas de una fecha válida: dentro del rango, no antes del piso de días, estrictamente
+  // anterior a la cita actual (la más temprana entre la orden y el portal) y no fantasma.
+  _dateFilter(currentBookedDate, minDate, maxDate) {
+    let minKey = minDate ? dateKey(minDate) : null;
+    let floorDate = null;
+    if (this.minDaysFromToday > 0) {
+      floorDate = limaDate(Date.now() + this.minDaysFromToday * 86400000);
+      const floorKey = dateKey(floorDate);
+      if (minKey === null || floorKey > minKey) minKey = floorKey;
+    }
+    const effectiveCurrent = this._effectiveCurrentDate(currentBookedDate);
+    return {
+      minKey,
+      floorDate,
+      maxKey: maxDate ? dateKey(maxDate) : null,
+      currentKey: effectiveCurrent ? dateKey(effectiveCurrent) : null,
+      now: Date.now(),
+    };
+  }
+
+  _filterFacilityDates(facilityId, dates, f) {
+    const rejected = { invalid: 0, beforeMin: 0, afterMax: 0, notEarlier: 0, ghost: 0 };
+    const good = [];
+    for (const date of new Set(dates)) {
+      let key;
+      try { key = dateKey(date); } catch { rejected.invalid += 1; continue; }
+      if (f.minKey !== null && key < f.minKey) { rejected.beforeMin += 1; continue; }
+      if (f.maxKey !== null && key > f.maxKey) { rejected.afterMax += 1; continue; }
+      if (f.currentKey !== null && key >= f.currentKey) { rejected.notEarlier += 1; continue; }
+      if (this._ghostBlocked(facilityId, date, f.now)) { rejected.ghost += 1; continue; }
+      good.push({ date, facilityId, key });
+    }
+    return { good, rejected };
   }
 
   async bookAppointment(sessionHeaders, date, facilityId = this.config.facilityId) {
@@ -349,6 +370,19 @@ export class Bot {
     }
     return null;
   }
+}
+
+function rankCandidates(candidates) {
+  const sorted = [...candidates].sort((a, b) => a.key - b.key);
+  const seen = new Set();
+  const result = [];
+  for (const c of sorted) {
+    const k = `${c.facilityId}:${c.date}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push({ date: c.date, facilityId: c.facilityId });
+  }
+  return result;
 }
 
 // Fecha YYYY-MM-DD en Lima (UTC-5, sin horario de verano)

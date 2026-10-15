@@ -6,7 +6,7 @@ import path from 'path';
 import { Response } from 'node-fetch';
 import { VisaHttpClient, parseRescheduleLimit, describeNetworkError, parseCurrentAppointment } from '../src/lib/client.js';
 import { Bot, limaDate } from '../src/lib/bot.js';
-import { createNapper, errorSpacingSeconds, focusDelaySeconds, parseFocusWindow } from '../src/commands/bot.js';
+import { createNapper, errorSpacingSeconds, focusDelaySeconds, gridDelaySeconds, parseFocusWindow, parsePhase } from '../src/commands/bot.js';
 
 function response(body, options, url) {
   const r = new Response(body, options);
@@ -224,4 +224,26 @@ test('when the order and the portal disagree, the earliest current date is used'
   bot.portalCurrentDate = '2027-01-31';
   const dates = await bot.checkAvailableDates({}, '2027-05-20', null, null);
   assert.deepEqual(dates.map(d => d.date), ['2026-11-13', '2027-01-10']);
+});
+
+// ---------- flota ----------
+test('dates shared by another order are filtered with this order rules', () => {
+  const bot = new Bot(cfg({ onlyBusinessDay: true }), { client: {} });
+  const days = [
+    { date: '2026-11-13', business_day: true },
+    { date: '2026-11-14', business_day: false }, // no hábil: esta orden lo excluye
+    { date: '2027-08-01', business_day: true },  // no es anterior a la cita actual
+  ];
+  assert.deepEqual(bot.filterSharedDates('115', days, '2027-05-20', null, null), [{ date: '2026-11-13', facilityId: '115' }]);
+  assert.deepEqual(bot.filterSharedDates('999', days, '2027-05-20', null, null), []); // otro consulado
+});
+
+test('poll turns spread orders evenly across the period', () => {
+  const base = Date.UTC(2026, 9, 14, 12, 0, 0); // borde exacto de un periodo de 4 s
+  const near = (a, b) => Math.abs(a - b) < 0.15;
+  assert.ok(near(gridDelaySeconds(4, 0, base + 100), 3.9));   // turno 0: próximo borde
+  assert.ok(near(gridDelaySeconds(4, 0.5, base + 100), 1.9)); // turno 1/2: 2 s después del borde
+  assert.equal(parsePhase('0.25'), 0.25);
+  assert.equal(parsePhase('1'), null);
+  assert.equal(parsePhase(''), null);
 });

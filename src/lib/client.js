@@ -219,6 +219,7 @@ export class VisaHttpClient {
     }
 
     log(`##DATES##${JSON.stringify(data)}`);
+    this.lastDays = data; // respuesta cruda, para compartirla con las demás órdenes
     const items = onlyBusinessDay ? data.filter(item => item.business_day !== false) : data;
     return items.map(item => item.date);
   }
