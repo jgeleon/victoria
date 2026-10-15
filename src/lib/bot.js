@@ -27,6 +27,7 @@ export class Bot {
     this._reuseTried = false;    // la sesión en disco se intenta solo en el primer initialize del proceso
     this.reusedSession = false;  // la sesión actual vino de disco y aún no se validó con una consulta
     this.portalCurrentDate = null; // cita actual real según el portal (página de Grupos)
+    this.searchRange = null;       // { current, min, max } de la orden, para revalidar antes del POST
     this._warnedMismatch = false;
     this.minDaysFromToday = Number(this.config.minDaysFromToday) || 0;
     this.dateFailuresFile = options.dateFailuresFile || this.config.dateFailuresFile || null;
@@ -213,6 +214,34 @@ export class Bot {
     return good.length ? rankCandidates(good) : [];
   }
 
+  setSearchRange({ current, min, max } = {}) {
+    this.searchRange = { current: current || null, min: min || null, max: max || null };
+  }
+
+  // Motivo por el que la fecha ya no se puede reservar, o null si sigue siendo válida.
+  _revalidateBeforePost(date) {
+    if (!this.searchRange) return null;
+    const { current, min, max } = this.searchRange;
+    const f = this._dateFilter(current, min, max);
+    let key;
+    try { key = dateKey(date); } catch { return 'fecha inválida'; }
+    if (f.currentKey !== null && key >= f.currentKey) return `no es anterior a la cita actual ${this._effectiveCurrentDate(current)}`;
+    if (f.minKey !== null && key < f.minKey) return `es anterior al mínimo permitido${f.floorDate ? ` (piso ${f.floorDate})` : ''}`;
+    if (f.maxKey !== null && key > f.maxKey) return `es posterior al máximo ${max}`;
+    return null;
+  }
+
+  // Si la cita actual ya es igual o anterior al límite mínimo, ninguna fecha puede mejorarla.
+  // Devuelve { current, limit } en ese caso, o null.
+  improvementImpossible() {
+    if (!this.searchRange) return null;
+    const { current, min, max } = this.searchRange;
+    const f = this._dateFilter(current, min, max);
+    if (f.currentKey === null || f.minKey === null || f.currentKey > f.minKey) return null;
+    const limit = f.floorDate && (!min || f.floorDate > min) ? `${f.floorDate} (hoy + ${this.minDaysFromToday} días)` : min;
+    return { current: this._effectiveCurrentDate(current), limit };
+  }
+
   _facilityIds() {
     return ((this.config.facilityIds && this.config.facilityIds.length) ? this.config.facilityIds : [this.config.facilityId]).map(String);
   }
@@ -269,6 +298,14 @@ export class Bot {
     if (!times || times.length === 0) {
       log(`no available time slots for date ${date} @${facilityId}`);
       this._recordDateFailure(facilityId, date);
+      return null;
+    }
+
+    // Tercera capa: revalidar justo antes de enviar (la fecha pudo venir de otra orden, o la
+    // cita actual pudo cambiar desde la consulta)
+    const invalid = this._revalidateBeforePost(date);
+    if (invalid) {
+      log(`🛡️ Revalidación antes de reservar: ${date} ya no sirve (${invalid}). No envío nada.`);
       return null;
     }
 

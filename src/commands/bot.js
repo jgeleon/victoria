@@ -10,6 +10,12 @@ const JITTER_FACTOR = 0.2;
 // Dormido: sin peticiones, sesión en memoria. Cada tanto una consulta para que no caduque.
 const IDLE_KEEPALIVE_SECONDS = 10 * 60;
 
+function atLimitError({ current, limit }) {
+  const e = new Error(`La cita actual (${current}) ya está en el límite mínimo (${limit}): ninguna fecha puede mejorarla.`);
+  e.code = 'EAT_LIMIT';
+  return e;
+}
+
 // Portal saturado (5xx o lento): no es un bloqueo. Se sigue buscando con reintentos cortos y
 // solo se frena si la saturación se prolonga.
 export function saturationDelaySeconds(count) {
@@ -86,6 +92,7 @@ export async function botCommand(rawOptions) {
   const config = getConfig();
   const bot = new Bot(config, { dryRun: options.dryRun, sessionFile: process.env.SESSION_FILE });
   const notifier = new Notifier(config);
+  bot.setSearchRange({ current: options.current, min: options.min, max: options.max });
   // Ritmo actual. El supervisor lo cambia en caliente (normal <-> boost) por IPC, sin reiniciar
   // el proceso: así la sesión y las conexiones abiertas se conservan.
   let delaySeconds = config.refreshDelay;
@@ -186,6 +193,10 @@ export async function botCommand(rawOptions) {
   let metricsAt = Date.now();
 
   while (true) {
+    // Con los datos de la propia orden ya se puede saber que no hay nada que mejorar: sin login
+    const stuckBefore = bot.improvementImpossible();
+    if (stuckBefore) throw atLimitError(stuckBefore);
+
     let sessionHeaders;
     try {
       sessionHeaders = await bot.initialize();
@@ -208,6 +219,10 @@ export async function botCommand(rawOptions) {
           if (idle && !woken) log('💤 Consulta de mantenimiento para que la sesión no caduque');
           else if (idle && !sharedDates) continue;
         }
+
+        // Si la cita ya está en el límite mínimo, nada puede mejorarla: detener y avisar
+        const stuck = bot.improvementImpossible();
+        if (stuck) throw atLimitError(stuck);
 
         // Fechas que vio otra orden: si alguna le sirve a ESTA orden, ir directo a reservar
         if (sharedDates) {
@@ -354,7 +369,7 @@ function logSearchOptions(options) {
 }
 
 function isPermanentError(error) {
-  return ['ESCHEMA', 'ECONFIG', 'EBOOKING_UNVERIFIED', 'EHTTP', 'ECREDENTIALS', 'ELOCKED', 'ENOLIMIT'].includes(error?.code);
+  return ['ESCHEMA', 'ECONFIG', 'EBOOKING_UNVERIFIED', 'EHTTP', 'ECREDENTIALS', 'ELOCKED', 'ENOLIMIT', 'EAT_LIMIT'].includes(error?.code);
 }
 
 function backoffSeconds(steps, failureCount) {

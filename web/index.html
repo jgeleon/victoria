@@ -71,6 +71,7 @@
   .badge.paused{background:var(--amberbg);color:var(--amber);border:1px solid rgba(210,153,34,.4)}
   .badge.booked{background:rgba(46,160,67,.18);color:var(--greenb);border:1px solid rgba(46,160,67,.5)}
   .badge.error{background:rgba(229,83,75,.15);color:var(--red);border:1px solid rgba(229,83,75,.4)}
+  .badge.at_limit{background:rgba(47,129,247,.15);color:var(--accent);border:1px solid rgba(47,129,247,.4)}
   .badge.auth_error,.badge.no_reschedules,.badge.verify{background:rgba(229,83,75,.2);color:#ff7b72;border:1px solid rgba(229,83,75,.5)}
   .badge.blocked{background:rgba(229,83,75,.2);color:#ff7b72;border:1px solid rgba(229,83,75,.5)}
   .badge.boost{background:rgba(210,153,34,.2);color:var(--amber);border:1px solid rgba(210,153,34,.55)}
@@ -298,7 +299,7 @@ function updateBoostFocusWarn(){
   el.style.display='block';
 }
 ['f_boostAt','f_boostFocus','f_boostEnabled'].forEach(id=>{ const el=document.getElementById(id); if(el){ el.addEventListener('input',updateBoostFocusWarn); el.addEventListener('change',updateBoostFocusWarn); } });
-const EST_LABEL={running:'En ejecución',paused:'Pausada',stopped:'Detenido',finished:'Finalizada',error:'Error',booked:'Reservada ✓',blocked:'Detenido por bloqueo',boost:'⚡ Boost',waiting:'Esperando boost',stopping:'Deteniendo…',auth_error:'🔐 Credenciales / cuenta bloqueada',no_reschedules:'🚫 Sin reprogramaciones',verify:'⚠️ Verificar reserva'};
+const EST_LABEL={running:'En ejecución',paused:'Pausada',stopped:'Detenido',finished:'Finalizada',error:'Error',booked:'Reservada ✓',blocked:'Detenido por bloqueo',boost:'⚡ Boost',waiting:'Esperando boost',stopping:'Deteniendo…',auth_error:'🔐 Credenciales / cuenta bloqueada',no_reschedules:'🚫 Sin reprogramaciones',verify:'⚠️ Verificar reserva',at_limit:'🏁 Cita en el límite'};
 
 // ---------- render tabla ----------
 function render(){
@@ -323,7 +324,7 @@ function render(){
       ? '<span class="done">¡Cita reservada!</span>'
       : st==='blocked'
       ? '<span class="badge blocked">Detenido por bloqueo</span>'
-      : (st==='auth_error'||st==='no_reschedules'||st==='verify')
+      : (st==='auth_error'||st==='no_reschedules'||st==='verify'||st==='at_limit')
       ? '<span class="badge '+st+'">'+EST_LABEL[st]+'</span>'
       : (st==='finished' ? '<span class="done">Finalizada</span>' : '<span class="pend">Pendiente</span>');
     const cycleInfo = (o.durationMin||o.intervalMin)

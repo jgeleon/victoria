@@ -262,3 +262,26 @@ test('saturation keeps searching with short retries and only slows down if it la
   assert.equal(saturationDelaySeconds(20), 3);
   assert.equal(saturationDelaySeconds(50), 10);
 });
+
+// ---------- revalidación y límite mínimo ----------
+test('a date that stopped being valid is never posted', async () => {
+  let posted = false;
+  const client = { checkAvailableTimes: async () => ['10:15'], book: async () => { posted = true; } };
+  const bot = new Bot(cfg(), { client });
+  bot.setSearchRange({ current: '2027-05-20', min: '2026-11-01', max: null });
+  bot.portalCurrentDate = '2026-11-10'; // la cita real resultó ser anterior a la fecha encontrada
+  assert.equal(await bot.bookAppointment({}, '2026-11-13', '115'), null);
+  assert.equal(posted, false);
+  assert.match(bot._revalidateBeforePost('2026-10-20'), /anterior al mínimo/);
+  assert.equal(bot._revalidateBeforePost('2026-11-05'), null);
+});
+
+test('an appointment already at the minimum limit cannot be improved', () => {
+  const bot = new Bot(cfg(), { client: {} });
+  bot.setSearchRange({ current: '2026-12-01', min: '2026-12-01', max: null });
+  assert.deepEqual(bot.improvementImpossible(), { current: '2026-12-01', limit: '2026-12-01' });
+  bot.setSearchRange({ current: '2027-05-20', min: '2026-12-01', max: null });
+  assert.equal(bot.improvementImpossible(), null);
+  bot.portalCurrentDate = '2026-11-25'; // el portal dice que ya está antes del mínimo
+  assert.equal(bot.improvementImpossible().current, '2026-11-25');
+});

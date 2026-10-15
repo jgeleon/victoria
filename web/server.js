@@ -231,7 +231,9 @@ function childConnected(ctrl) { return !!(ctrl.child && ctrl.child.connected); }
 
 function sendToChild(ctrl, msg) {
   if (!childConnected(ctrl)) return false;
-  try { ctrl.child.send(msg); return true; } catch { return false; }
+  // Con callback, un envío fallido (canal que se está cerrando: EPIPE) llega aquí y no como
+  // evento 'error' sin manejar, que tumbaría el servidor entero.
+  try { ctrl.child.send(msg, () => {}); return true; } catch { return false; }
 }
 
 // Cierre ordenado: el bot guarda la sesión y sale. Si no responde, se fuerza.
@@ -573,6 +575,8 @@ function beginRun(o, ctrl, mode, { lifeMs } = {}) {
     if (isErr) errBuf = buf; else outBuf = buf;
   };
   cp.on('message', (m) => onChildMessage(o, ctrl, m));
+  // Un error del proceso o de su canal nunca debe tumbar el servidor (y con él todas las órdenes)
+  cp.on('error', (err) => appendLog(ctrl.runId, `⚠️ Error de comunicación con el bot: ${err.code || err.message}`));
   cp.stdout.on('data', (c) => handle(c, false));
   cp.stderr.on('data', (c) => handle(c, true));
 
@@ -634,6 +638,7 @@ const FATAL_EXITS = {
   3: { status: 'auth_error', msg: '🔐 Email o contraseña incorrectos, o cuenta bloqueada por el portal. Revisa la orden antes de reintentar.' },
   4: { status: 'no_reschedules', msg: '🚫 El portal indica 0 reprogramaciones restantes. Orden detenida.' },
   5: { status: 'verify', msg: '⚠️ No se pudo confirmar si la reserva se hizo. Revisa la cita en el portal antes de reiniciar.' },
+  6: { status: 'at_limit', msg: '🏁 La cita actual ya está en el límite mínimo de la orden: ninguna fecha puede mejorarla. Orden detenida.' },
 };
 
 // Ventana de liberación de Perú (segundos del minuto) medida en visa-scraper
